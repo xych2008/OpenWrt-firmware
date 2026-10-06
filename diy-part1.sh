@@ -2,7 +2,7 @@
 # diy-part1.sh：云端注入 lelink_le2 设备树 + 注册设备 + 网络配置
 # 连乐2 Lelink LE2 / QCA9531 / 16MB / NVMEM 校准 / SPI 30MHz+fast-read / 单段四分区（无 OKLI）
 echo "=====写入连乐2 QCA9531 DTS设备树====="
-cat > target/linux/ath79/dts/lelink_le2.dts << 'DTS_EOF'
+cat > target/linux/ath79/dts/qca9531_lelink_le2.dts << 'DTS_EOF'
 // SPDX-License-Identifier: GPL-2.0-or-later OR MIT
 /dts-v1/;
 
