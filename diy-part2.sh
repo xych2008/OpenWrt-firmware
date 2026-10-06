@@ -1,20 +1,15 @@
 #!/bin/bash
-#
-# https://github.com/P3TERX/Actions-OpenWrt
-# File name: diy-part2.sh
-# Description: OpenWrt DIY script part 2 (After Update feeds)
-#
-# Copyright (c) 2019-2024 P3TERX <https://p3terx.com>
-#
-# This is free software, licensed under the MIT License.
-# See /LICENSE for more information.
-#
+# diy-part2.sh：写入开机脚本（wlan0并入LAN桥、清空NAT）+ 改后台IP
+mkdir -p files/etc
+cat > files/etc/rc.local << 'EOF'
+#!/bin/sh
+# 开机延时后执行：无线wlan0并入LAN桥、清空NAT（二层透明）
+sleep 8
+brctl addif br-lan wlan0 2>/dev/null
+iptables -F
+iptables -t nat -F
+exit 0
+EOF
 
-# Modify default IP
-#sed -i 's/192.168.1.1/192.168.50.5/g' package/base-files/files/bin/config_generate
-
-# Modify default theme
-#sed -i 's/luci-theme-bootstrap/luci-theme-argon/g' feeds/luci/collections/luci/Makefile
-
-# Modify hostname
-#sed -i 's/OpenWrt/P3TERX-Router/g' package/base-files/files/bin/config_generate
+# 修改默认后台IP 192.168.2.1，避开主路由192.168.1.1
+sed -i 's/192.168.1.1/192.168.2.1/g' package/base-files/files/bin/config_generate
