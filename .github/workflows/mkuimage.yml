@@ -1,1 +1,50 @@
-.github/workflows/mkuimage.yml
+name: Make uImage for LE2
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download initramfs
+        run: |
+          FILE=immortalwrt-ath79-generic-lelink_le2-initramfs-kernel.bin
+          wget -q "https://github.com/xych2008/OpenWrt-firmware/releases/download/2026.10.06-1534/$FILE"
+          echo "56e21764fdb4c7f88c573ea91c54fa5606c9e07fe809e73e2c004e4fa9213c53  $FILE" | sha256sum -c -
+          ls -l $FILE
+
+      - name: Install u-boot-tools
+        run: sudo apt-get update && sudo apt-get install -y u-boot-tools
+
+      - name: Make uImage
+        run: |
+          FILE=immortalwrt-ath79-generic-lelink_le2-initramfs-kernel.bin
+          echo "--- first bytes ---"
+          xxd -l 8 $FILE
+          MAGIC=$(xxd -p -l 4 $FILE | tr -d ' ')
+          MAGIC2=$(xxd -p -l 2 $FILE | tr -d ' ')
+          if [ "$MAGIC" = "5d000080" ]; then CMP=lzma
+          elif [ "$MAGIC2" = "1f8b" ]; then CMP=gzip
+          elif [ "$MAGIC" = "fd377a58" ]; then CMP=xz
+          else CMP=none; fi
+          echo "detected compression: $CMP"
+          mkimage -A mips -O linux -T kernel -C "$CMP" -a 0x80060000 -e 0x80060000 \
+            -n "LE2 initramfs" -d $FILE immortalwrt-ath79-generic-lelink_le2-initramfs-uImage.bin
+          mkimage -l immortalwrt-ath79-generic-lelink_le2-initramfs-uImage.bin
+          sha256sum immortalwrt-ath79-generic-lelink_le2-initramfs-uImage.bin
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: lelink_le2-uImage
+          path: immortalwrt-ath79-generic-lelink_le2-initramfs-uImage.bin
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: uimage-20261007-0820
+          name: LE2 initramfs uImage
+          files: immortalwrt-ath79-generic-lelink_le2-initramfs-uImage.bin
