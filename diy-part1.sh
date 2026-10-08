@@ -90,7 +90,7 @@ cat > target/linux/ath79/dts/qca9531_lelink_le2.dts << 'DTS_EOF'
 };
 DTS_EOF
 
-# 2) 在 ath79/generic.mk 末尾注册设备（标准 uImage，无 OKLI）
+# 2) 在 ath79/generic.mk 末尾注册设备（标准 uImage，无 OKLI；同时产出 Breed 可直刷的 factory.bin）
 cat >> target/linux/ath79/image/generic.mk << 'MK_EOF'
 
 define Device/lelink_le2
@@ -98,7 +98,9 @@ define Device/lelink_le2
   DEVICE_VENDOR := Lelink
   DEVICE_MODEL := LE2
   IMAGE_SIZE := 16000k
-  IMAGES := sysupgrade.bin
+  IMAGES := sysupgrade.bin factory.bin
+  IMAGE/factory.bin := append-kernel | pad-to $$$$(BLOCKSIZE) | \
+	append-rootfs | pad-rootfs | check-size
 endef
 TARGET_DEVICES += lelink_le2
 MK_EOF
