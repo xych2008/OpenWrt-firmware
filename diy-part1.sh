@@ -92,10 +92,13 @@ cat > target/linux/ath79/dts/qca9531_lelink_le2.dts << 'DTS_EOF'
 	status = "okay";
 	nvmem-cells = <&macaddr_art_0>;
 	nvmem-cell-names = "mac-address";
+	phy-handle = <&swphy4>;
 };
 
 &eth1 {
 	compatible = "qca,qca9530-eth", "syscon", "simple-mfd";
+	nvmem-cells = <&macaddr_art_6>;
+	nvmem-cell-names = "mac-address";
 };
 
 &wmac {
@@ -113,7 +116,7 @@ define Device/lelink_le2
   SOC := qca9531
   DEVICE_VENDOR := Lelink
   DEVICE_MODEL := LE2
-  IMAGE_SIZE := 16000k
+  IMAGE_SIZE := 15936k
   LOADER_FLASH_OFFS := 0x50000
   KERNEL := kernel-bin | append-dtb | lzma | uImage lzma -M 0x4f4b4c49
   IMAGES := sysupgrade.bin factory.bin
@@ -126,4 +129,4 @@ MK_EOF
 
 # 3) 02_network（LAN=lan1 lan2，WAN=eth0，MAC 从 art 0x0 取）
 BOARD_FILE=target/linux/ath79/generic/base-files/etc/board.d/02_network
-awk 'BEGIN{ins=0} /^esac$/{if(!ins){print "lelink,le2)"; print "\tucidef_set_interfaces_lan_wan \"lan1 lan2\" \"wan\""; print "\tucidef_set_interface_macaddr \"wan\" \"$(mtd_get_mac_binary art 0x0)\""; print "\t;;"; ins=1}} {print}' "$BOARD_FILE" > "$BOARD_FILE.tmp" && mv "$BOARD_FILE.tmp" "$BOARD_FILE"
+awk 'BEGIN{ins=0} /^esac$/{if(!ins){print "lelink,le2)"; print "\tucidef_set_interfaces_lan \"eth0 eth1\"";  print "\t;;"; ins=1}} {print}' "$BOARD_FILE" > "$BOARD_FILE.tmp" && mv "$BOARD_FILE.tmp" "$BOARD_FILE"
