@@ -1,6 +1,5 @@
 #!/bin/bash
-# 连乐2 / 乐视 LBA-047-CH  —— v2：全口并入 br-lan（有线可用）+ LED/复位键扫描工具
-# 布局不变：0x50000 = OKLI 内核+文件系统；0xE80000 = 64K loader（官方原厂方式）
+# 连乐2 v4：交换机全口(0 1 2 3 4) + LED 14/15/16 + SUPPORTED_DEVICES + iperf3
 set -e
 
 WS="${GITHUB_WORKSPACE:-$(cd .. && pwd)}"
@@ -9,30 +8,18 @@ if [ -d "target/linux/ath79" ]; then
 else
 	SRC="$WS/openwrt"
 fi
-[ -d "$SRC/target/linux/ath79" ] || { echo "!! 找不到 immortalwrt 源码树，退出"; exit 1; }
-echo "==> 仓库根: $WS"
-echo "==> 源码树: $SRC"
+[ -d "$SRC/target/linux/ath79" ] || { echo "!! 找不到源码树"; exit 1; }
 
-# ---------- 0b. 确保 routing feed 存在（nodogsplash 在 routing 里） ----------
-for f in "$SRC/feeds.conf" "$SRC/feeds.conf.default"; do
-	[ -f "$f" ] || continue
-	grep -q "routing" "$f" 2>/dev/null || \
-		echo "src-git routing https://github.com/openwrt/routing.git^23.05" >> "$f"
-	echo "==> $f 已确认 routing feed"
-done
-
-# ---------- 1. 屏蔽旧的 diy-part2.sh ----------
+# ---------- 1. 屏蔽旧 diy-part2.sh ----------
 cat > "$WS/diy-part2.sh" << 'EOS'
 #!/bin/bash
 exit 0
 EOS
 chmod +x "$WS/diy-part2.sh"
 
-# ---------- 2. .config 补必需包 ----------
+# ---------- 2. .config ----------
 CFG="$WS/.config"
-add_cfg() {
-	grep -q "^$1=y" "$CFG" 2>/dev/null || echo "$1=y" >> "$CFG"
-}
+add_cfg() { grep -q "^$1=y" "$CFG" 2>/dev/null || echo "$1=y" >> "$CFG"; }
 add_cfg CONFIG_PACKAGE_luci
 add_cfg CONFIG_PACKAGE_luci-base
 add_cfg CONFIG_PACKAGE_luci-i18n-base-zh-cn
@@ -44,15 +31,16 @@ add_cfg CONFIG_PACKAGE_aircrack-ng
 add_cfg CONFIG_PACKAGE_airmon-ng
 add_cfg CONFIG_PACKAGE_hcxdumptool
 add_cfg CONFIG_PACKAGE_hcxtools
-add_cfg CONFIG_PACKAGE_tmux
 add_cfg CONFIG_PACKAGE_reaver
 add_cfg CONFIG_PACKAGE_pixiewps
+add_cfg CONFIG_PACKAGE_tmux
 add_cfg CONFIG_PACKAGE_nodogsplash
 add_cfg CONFIG_PACKAGE_luci-app-commands
+add_cfg CONFIG_PACKAGE_iperf3
 sed -i '/CONFIG_PACKAGE_luci-network=y/d; /CONFIG_PACKAGE_luci-system=y/d' "$CFG" 2>/dev/null || true
 echo "==> .config 已补包"
 
-# ---------- 3. 设备定义（保持原样，OKLI 方案） ----------
+# ---------- 3. 设备定义：补 SUPPORTED_DEVICES ----------
 GMK="$SRC/target/linux/ath79/image/generic.mk"
 if grep -q "^define Device/lelink_le2$" "$GMK"; then
 	sed -i '/^define Device\/lelink_le2$/,/^TARGET_DEVICES += lelink_le2$/d' "$GMK"
@@ -60,12 +48,14 @@ fi
 cat >> "$GMK" << 'EOF'
 
 # 连乐2：沿用上游乐视 LBA-047-CH 的 DTS 与 OKLI 引导方案
+# 交换机端口：0=CPU(AR8228)，1/2 空，3/4 为两个物理网口
 define Device/lelink_le2
   $(Device/loader-okli-uimage)
   SOC := qca9531
   DEVICE_VENDOR := Lelink
   DEVICE_MODEL := LE2
   DEVICE_DTS := qca9531_letv_lba-047-ch
+  SUPPORTED_DEVICES := letv,lba-047-ch lelink,le2
   DEVICE_PACKAGES := -uboot-envtools
   FACTORY_SIZE := 14528k
   IMAGE_SIZE := 15936k
@@ -78,37 +68,47 @@ define Device/lelink_le2
 endef
 TARGET_DEVICES += lelink_le2
 EOF
-echo "==> OKLI 设备定义已写入"
+echo "==> 设备定义已写入（含 SUPPORTED_DEVICES）"
 
-# ---------- 4. 网络强制修正：所有网卡并入 br-lan，交换机单 VLAN 全 untagged ----------
+# ---------- 4. 改 DTS：LED 用实测的 14/15/16，高电平有效 ----------
+DTS="$SRC/target/linux/ath79/dts/qca9531_letv_lba-047-ch.dts"
+[ -f "$DTS" ] || { echo "!! 找不到 DTS"; exit 1; }
+python3 - "$DTS" << 'PY'
+import re,sys
+p=sys.argv[1]
+s=open(p).read()
+# LED0: 13 -> 14，高有效；LED1: 4 -> 15；LED2: 11 -> 16
+s=s.replace('<&gpio 13 GPIO_ACTIVE_LOW>','<&gpio 14 GPIO_ACTIVE_HIGH>')
+s=s.replace('<&gpio 4 GPIO_ACTIVE_LOW>','<&gpio 15 GPIO_ACTIVE_HIGH>')
+s=s.replace('<&gpio 11 GPIO_ACTIVE_LOW>','<&gpio 16 GPIO_ACTIVE_HIGH>')
+# 名字改成信号格
+s=s.replace('label = "blue:status"','label = "green:signal1"')
+s=s.replace('label = "green:status"','label = "green:signal2"')
+s=s.replace('label = "red:status"','label = "green:signal3"')
+open(p,'w').write(s)
+# 校验
+import subprocess
+print(subprocess.run(['grep','-n','gpios',p],capture_output=True,text=True).stdout)
+PY
+echo "==> DTS 已改"
+
+# ---------- 5. 网络：交换机全口 0 1 2 3 4（3/4 才是物理网口） ----------
 mkdir -p "$SRC/files/etc/uci-defaults"
 cat > "$SRC/files/etc/uci-defaults/99-le2-net" << 'EOF'
 #!/bin/sh
-# 连乐2 网口修正：上游 02_network 用的是不存在的端口 3/4
-# 本板 switch0 只有 LAN1/LAN2 两个口 + CPU(eth1)。这里整体重建，全部并入 br-lan。
 u() { uci -q "$@"; }
-
-# 1) 去掉 wan / wan6（两个物理口都当 LAN 用）
 u delete network.wan
 u delete network.wan6
-
-# 2) 清掉自动生成的 switch / switch_vlan（含错误的 3、4 号口）
 while u delete network.@switch_vlan[0]; do :; done
 while u delete network.@switch[0]; do :; done
-
-# 3) 清掉已有名为 br-lan 的 device 段
 for i in 9 8 7 6 5 4 3 2 1 0; do
 	[ "$(u get network.@device[$i].name)" = "br-lan" ] && u delete network.@device[$i]
 done
-
-# 4) 建 br-lan：eth0 + eth1 全进桥，插哪个口都能进后台
 u add network device
 u set network.@device[-1].name='br-lan'
 u set network.@device[-1].type='bridge'
 u add_list network.@device[-1].ports='eth0'
 u add_list network.@device[-1].ports='eth1'
-
-# 5) 交换机：单 VLAN，CPU 口与两个物理口全部 untagged
 u add network switch
 u set network.@switch[-1].name='switch0'
 u set network.@switch[-1].reset='1'
@@ -116,22 +116,19 @@ u set network.@switch[-1].enable_vlan='1'
 u add network switch_vlan
 u set network.@switch_vlan[-1].device='switch0'
 u set network.@switch_vlan[-1].vlan='1'
-u set network.@switch_vlan[-1].ports='0 1 2'
-
-# 6) lan 接口
+u set network.@switch_vlan[-1].ports='0 1 2 3 4'
 u set network.lan='interface'
 u set network.lan.device='br-lan'
 u set network.lan.proto='static'
 u set network.lan.ipaddr='192.168.1.1'
 u set network.lan.netmask='255.255.255.0'
 u set network.lan.ip6assign='60'
-
 u commit network
 exit 0
 EOF
 chmod +x "$SRC/files/etc/uci-defaults/99-le2-net"
 
-# ---------- 5. WiFi 默认开 ----------
+# ---------- 6. WiFi / 时区 / nodogsplash ----------
 cat > "$SRC/files/etc/uci-defaults/99-le2-wifi" << 'EOF'
 #!/bin/sh
 [ -f /etc/config/wireless ] || wifi config >/dev/null 2>&1
@@ -147,7 +144,6 @@ exit 0
 EOF
 chmod +x "$SRC/files/etc/uci-defaults/99-le2-wifi"
 
-# ---------- 6. 时区 / NTP ----------
 cat > "$SRC/files/etc/uci-defaults/99-le2-tz" << 'EOF'
 #!/bin/sh
 uci -q set system.@system[0].timezone='CST-8' || true
@@ -155,96 +151,71 @@ uci -q set system.@system[0].zonename='Asia/Shanghai' || true
 uci -q set system.@system[0].ntp='1' || true
 uci -q set system.ntp='timeserver' || true
 uci -q commit system
-exit 0
-EOF
-chmod +x "$SRC/files/etc/uci-defaults/99-le2-tz"
-
-# ---------- 6b. nodogsplash 默认不启用（免得它抢了 br-lan 的上网） ----------
-cat > "$SRC/files/etc/uci-defaults/99-le2-misc" << 'EOF'
-#!/bin/sh
 [ -x /etc/init.d/nodogsplash ] && /etc/init.d/nodogsplash disable 2>/dev/null
 exit 0
 EOF
-chmod +x "$SRC/files/etc/uci-defaults/99-le2-misc"
+chmod +x "$SRC/files/etc/uci-defaults/99-le2-tz"
 
 # ---------- 7. GPIO 扫描工具 ----------
 mkdir -p "$SRC/files/usr/bin"
 cat > "$SRC/files/usr/bin/led-scan" << 'EOF'
 #!/bin/sh
 G=/sys/class/gpio
-[ -d $G ] || { echo "没有 $G，内核未开 GPIO sysfs"; exit 1; }
-echo "开始扫描 GPIO 0-31，每个亮 2 秒。看面板哪个灯亮 = 那个编号"
-for i in 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31; do
+[ -d $G ] || { echo "no $G"; exit 1; }
+echo "扫描 GPIO 0-22，每个亮 2 秒，记录亮灯编号（14/15/16 是信号灯，已被占用会跳过）"
+for i in 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22; do
 	echo $i > $G/export 2>/dev/null || continue
-	if ! echo out > $G/gpio$i/direction 2>/dev/null; then
-		echo $i > $G/unexport 2>/dev/null
-		continue
-	fi
+	echo out > $G/gpio$i/direction 2>/dev/null || { echo $i > $G/unexport; continue; }
 	echo 1 > $G/gpio$i/value 2>/dev/null
 	echo "===== GPIO $i ====="
 	sleep 2
 	echo 0 > $G/gpio$i/value 2>/dev/null
-	sleep 1
 	echo $i > $G/unexport 2>/dev/null
 done
-echo "扫描结束。把亮灯时对应的编号告诉我"
 EOF
 chmod +x "$SRC/files/usr/bin/led-scan"
 
 cat > "$SRC/files/usr/bin/btn-scan" << 'EOF'
 #!/bin/sh
+# 简化版：先打印全部输入电平，再提示按键，第二次打印，靠肉眼比对
 G=/sys/class/gpio
-[ -d $G ] || { echo "没有 $G"; exit 1; }
-snap() {
-	for i in 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31; do
+L="0 1 2 3 4 5 6 7 8 9 10 11 12 13 17 18 19 20 21 22"
+scan() {
+	for i in $L; do
 		echo $i > $G/export 2>/dev/null
-		if echo in > $G/gpio$i/direction 2>/dev/null; then
-			echo "$i=$(cat $G/gpio$i/value 2>/dev/null)"
-		else
-			echo $i > $G/unexport 2>/dev/null
-		fi
+		echo in > $G/gpio$i/direction 2>/dev/null || continue
+		echo "G$i=$(cat $G/gpio$i/value 2>/dev/null)"
 	done
 }
-echo "第一步：不要按键，采集基准..."
-snap > /tmp/gpio-a.txt
-echo "基准已采集，可用 GPIO $(grep -c '=' /tmp/gpio-a.txt) 个"
-echo ""
-echo "第二步：现在按住复位键别松手，10 秒后自动对比 —— 按！"
+echo "----- 未按下 -----"
+scan
+echo "----- 现在按住复位键 10 秒 -----"
 sleep 10
-snap > /tmp/gpio-b.txt
-echo "有变化的（GPIO : 基准 -> 按住时）："
-awk -F= 'NR==FNR{a[$1]=$2;next} ($1 in a) && a[$1]!=$2 {print "  GPIO " $1 " : " a[$1] " -> " $2}' /tmp/gpio-a.txt /tmp/gpio-b.txt
-echo ""
-echo "若无输出，说明复位键不在这批 GPIO；把 /tmp/gpio-a.txt、/tmp/gpio-b.txt 内容发我"
+echo "----- 按住中 -----"
+scan
+echo "对比两段，值变了的那行就是复位键"
 EOF
 chmod +x "$SRC/files/usr/bin/btn-scan"
 
-# ---------- 8. rc.local：兜底桥接 + 诊断文件放到网页 ----------
+# ---------- 8. rc.local ----------
 cat > "$SRC/files/etc/rc.local" << 'EOF'
 #!/bin/sh
-sleep 8
+sleep 5
 for i in eth0 eth1; do
-	ip link set $i master br-lan 2>/dev/null || brctl addif br-lan $i 2>/dev/null
+	ip link set $i master br-lan 2>/dev/null || true
 done
 swconfig dev switch0 set enable_vlan 1 2>/dev/null
-swconfig dev switch0 vlan 1 set ports "0 1 2" 2>/dev/null
-
-# 浏览器直接开 http://192.168.1.1/diag-net.txt 就能看到诊断，不用 SSH
+swconfig dev switch0 vlan 1 set ports "0 1 2 3 4" 2>/dev/null
 { echo "=== swconfig ==="; swconfig dev switch0 show 2>&1;
-  echo "=== ip link ==="; ip -br link 2>&1;
-  echo "=== ip addr ==="; ip -br addr 2>&1;
   echo "=== brctl ==="; brctl show 2>&1;
+  echo "=== speed ==="; cat /sys/class/net/eth0/speed /sys/class/net/eth1/speed 2>&1;
   echo "=== network ==="; cat /etc/config/network 2>&1; } > /www/diag-net.txt 2>&1
-
 exit 0
 EOF
 chmod +x "$SRC/files/etc/rc.local"
 
 # ---------- 9. 自检 ----------
-echo "---- .config 关键项 ----"
-grep -E 'DEVICE_lelink_le2|PACKAGE_wpad|PACKAGE_aircrack|PACKAGE_kmod-ath9k|PACKAGE_luci-app-commands' "$CFG" || true
-echo "---- 设备定义 ----"
-grep -A 14 'define Device/lelink_le2' "$GMK"
-echo "---- 新脚本 ----"
-ls -l "$SRC/files/etc/uci-defaults/" && ls -l "$SRC/files/usr/bin/" && ls -l "$SRC/files/etc/rc.local"
+echo "---- 设备定义 ----"; grep -A 16 'define Device/lelink_le2' "$GMK"
+echo "---- DTS LED ----"; grep -n -B1 "GPIO_ACTIVE_HIGH\|gpios = <&gpio 17" "$DTS"
+echo "---- 包 ----"; grep -E 'PACKAGE_iperf3|PACKAGE_hcxdumptool|PACKAGE_reaver' "$CFG"
 echo "==> 完成"
