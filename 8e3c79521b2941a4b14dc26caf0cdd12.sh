@@ -159,6 +159,14 @@ exit 0
 EOF
 chmod +x "$SRC/files/etc/uci-defaults/99-le2-tz"
 
+# ---------- 6b. nodogsplash 默认不启用（免得它抢了 br-lan 的上网） ----------
+cat > "$SRC/files/etc/uci-defaults/99-le2-misc" << 'EOF'
+#!/bin/sh
+[ -x /etc/init.d/nodogsplash ] && /etc/init.d/nodogsplash disable 2>/dev/null
+exit 0
+EOF
+chmod +x "$SRC/files/etc/uci-defaults/99-le2-misc"
+
 # ---------- 7. GPIO 扫描工具 ----------
 mkdir -p "$SRC/files/usr/bin"
 cat > "$SRC/files/usr/bin/led-scan" << 'EOF'
