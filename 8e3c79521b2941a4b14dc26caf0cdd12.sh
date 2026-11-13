@@ -13,6 +13,14 @@ fi
 echo "==> 仓库根: $WS"
 echo "==> 源码树: $SRC"
 
+# ---------- 0b. 确保 routing feed 存在（nodogsplash 在 routing 里） ----------
+for f in "$SRC/feeds.conf" "$SRC/feeds.conf.default"; do
+	[ -f "$f" ] || continue
+	grep -q "routing" "$f" 2>/dev/null || \
+		echo "src-git routing https://github.com/openwrt/routing.git^23.05" >> "$f"
+	echo "==> $f 已确认 routing feed"
+done
+
 # ---------- 1. 屏蔽旧的 diy-part2.sh ----------
 cat > "$WS/diy-part2.sh" << 'EOS'
 #!/bin/bash
@@ -34,6 +42,12 @@ add_cfg CONFIG_PACKAGE_iw
 add_cfg CONFIG_PACKAGE_bridge-utils
 add_cfg CONFIG_PACKAGE_aircrack-ng
 add_cfg CONFIG_PACKAGE_airmon-ng
+add_cfg CONFIG_PACKAGE_hcxdumptool
+add_cfg CONFIG_PACKAGE_hcxtools
+add_cfg CONFIG_PACKAGE_tmux
+add_cfg CONFIG_PACKAGE_reaver
+add_cfg CONFIG_PACKAGE_pixiewps
+add_cfg CONFIG_PACKAGE_nodogsplash
 add_cfg CONFIG_PACKAGE_luci-app-commands
 sed -i '/CONFIG_PACKAGE_luci-network=y/d; /CONFIG_PACKAGE_luci-system=y/d' "$CFG" 2>/dev/null || true
 echo "==> .config 已补包"
