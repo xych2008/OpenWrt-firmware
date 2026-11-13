@@ -80,12 +80,7 @@ cat > "$SRC/target/linux/ramips/dts/mt7620a_qianmi_hd51.dts" << 'EOF'
 			partition@80000 {
 				compatible = "denx,uimage";
 				label = "firmware";
-				reg = <0x80000 0x6f0000>;
-			};
-
-			partition@770000 {
-				label = "data";
-				reg = <0x770000 0x890000>;
+				reg = <0x80000 0xf80000>;
 			};
 		};
 	};
@@ -126,7 +121,7 @@ cat >> "$GMK" << 'EOF'
 
 define Device/qianmi_hd51
   SOC := mt7620a
-  IMAGE_SIZE := 7104k
+  IMAGE_SIZE := 15872k
   DEVICE_VENDOR := Qianmi
   DEVICE_MODEL := HD51
   DEVICE_DTS := mt7620a_qianmi_hd51
