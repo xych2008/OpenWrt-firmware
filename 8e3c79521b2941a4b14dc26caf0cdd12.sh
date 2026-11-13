@@ -70,7 +70,7 @@ cat > "$SRC/target/linux/ramips/dts/mt7620a_qianmi_hd51.dts" << 'EOF'
 
 			partition@40000 {
 				label = "factory";
-				reg = <0x40000 0x40000>;
+				reg = <0x40000 0x10000>;
 				read-only;
 
 				nvmem-layout {
@@ -88,10 +88,10 @@ cat > "$SRC/target/linux/ramips/dts/mt7620a_qianmi_hd51.dts" << 'EOF'
 				};
 			};
 
-			partition@80000 {
+			partition@50000 {
 				compatible = "denx,uimage";
 				label = "firmware";
-				reg = <0x80000 0xf80000>;
+				reg = <0x50000 0xfb0000>;
 			};
 		};
 	};
@@ -132,7 +132,7 @@ cat >> "$GMK" << 'EOF'
 
 define Device/qianmi_hd51
   SOC := mt7620a
-  IMAGE_SIZE := 15872k
+  IMAGE_SIZE := 16320k
   DEVICE_VENDOR := Qianmi
   DEVICE_MODEL := HD51
   DEVICE_DTS := mt7620a_qianmi_hd51
