@@ -1,5 +1,10 @@
 #!/bin/bash
-# 连乐2 v8 = v7 功能不变，但启动路径退回 v4 原文（rc.local/rc.button 与 v4 逐字一致）
+# 连乐2 v9 = v8 功能不变 + 三项抗卡死加固
+#   1) 内核 panic=10：若卡住实为 panic，10 秒自动重启重试（有机会自愈）
+#   2) /etc/config/network 直接烘进镜像（不再依赖 uci-defaults 首启生成，少一步）
+#   3) 开机自记录 /etc/le2-boot.log：留存每次启动时间与异常，便于事后取证
+# 说明：断电冷启动的电源时序问题属硬件，固件层面无法根治；以上是能做的部分。
+# 以下为 v8 原始说明：启动路径退回 v4 原文（rc.local/rc.button 与 v4 逐字一致）
 # 实测结论：VLAN1 ports "0 1 2 3 4"、各口 pvid 1；LED 节点 green:signal1/2/3；
 #           br-lan = eth0 + eth1 + phy0-ap0；IP 192.168.1.1；工具路径已核对
 # 保持 v4 的“开机自愈”：sleep 5 + ip link set eth0/eth1 master br-lan + swconfig 兜底
@@ -80,6 +85,8 @@ python3 - "$DTS" << 'PY'
 import re,sys
 p=sys.argv[1]
 s=open(p).read()
+# v9：bootargs 追加 panic=10（卡住若为 panic，10 秒后自动重启重试）
+s=s.replace('bootargs = "console=ttyS0,115200n8";','bootargs = "console=ttyS0,115200n8 panic=10";')
 # LED0: 13 -> 14，高有效；LED1: 4 -> 15；LED2: 11 -> 16
 s=s.replace('<&gpio 13 GPIO_ACTIVE_LOW>','<&gpio 14 GPIO_ACTIVE_HIGH>')
 s=s.replace('<&gpio 4 GPIO_ACTIVE_LOW>','<&gpio 15 GPIO_ACTIVE_HIGH>')
@@ -130,6 +137,43 @@ u commit network
 exit 0
 EOF
 chmod +x "$SRC/files/etc/uci-defaults/99-le2-net"
+
+# ---------- 5.5 v9：network 配置直接烘进镜像（首启不再依赖 uci-defaults 生成） ----------
+mkdir -p "$SRC/files/etc/config"
+cat > "$SRC/files/etc/config/network" << 'EOF'
+config interface 'loopback'
+	option device 'lo'
+	option proto 'static'
+	option ipaddr '127.0.0.1'
+	option netmask '255.255.255.0'
+
+config globals 'globals'
+	option ula_prefix 'fd00:le2::/48'
+
+config device 'brlan'
+	option name 'br-lan'
+	option type 'bridge'
+	list ports 'eth0'
+	list ports 'eth1'
+
+config switch
+	option name 'switch0'
+	option reset '1'
+	option enable_vlan '1'
+
+config switch_vlan
+	option device 'switch0'
+	option vlan '1'
+	option ports '0 1 2 3 4'
+
+config interface 'lan'
+	option device 'br-lan'
+	option proto 'static'
+	option ipaddr '192.168.1.1'
+	option netmask '255.255.255.0'
+	option ip6assign '60'
+EOF
+echo "==> network 已烘进镜像"
 
 # ---------- 6. WiFi / 时区 / nodogsplash ----------
 cat > "$SRC/files/etc/uci-defaults/99-le2-wifi" << 'EOF'
@@ -249,7 +293,14 @@ swconfig dev switch0 vlan 1 set ports "0 1 2 3 4" 2>/dev/null
 { echo "=== swconfig ==="; swconfig dev switch0 show 2>&1;
   echo "=== brctl ==="; brctl show 2>&1;
   echo "=== speed ==="; cat /sys/class/net/eth0/speed /sys/class/net/eth1/speed 2>&1;
-  echo "=== network ==="; cat /etc/config/network 2>&1; } > /www/diag-net.txt 2>&1
+  echo "=== network ==="; cat /etc/config/network 2>&1; } > /tmp/diag-net.txt 2>&1
+
+# v9：每次启动留痕（写在 overlay，重启不丢；只要 overlay 正常挂上就一定会写）
+{
+	echo "boot=$(date '+%F %T')  uptime=$(cut -d' ' -f1 /proc/uptime)"
+	echo "overlay=$(grep -c ' /overlay ' /proc/mounts)"
+	echo "--------------"
+} >> /etc/le2-boot.log 2>/dev/null
 
 # LED 点灯放到开机 20 秒后的后台子进程里，绝不影响启动
 (
