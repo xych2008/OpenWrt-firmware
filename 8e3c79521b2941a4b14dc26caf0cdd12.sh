@@ -114,12 +114,13 @@ cat > "$SRC/target/linux/ramips/dts/mt7620a_qianmi_hd51.dts" << 'EOF'
 };
 
 &wmac {
-	/* v6：把 dtsi 里那条 ralink,eeprom = "soc_wmac.eeprom" 字符串属性直接删掉。
-	   实测 dmesg 证明驱动优先用了它 → 去 request_firmware 找不存在的文件
-	   → "Failed to request EEPROM" → phy0 创建后注册失败 → 无广播。
-	   v5 只加了 mtd-eeprom，日志没变，说明它没被优先使用，必须删干净。 */
-	/delete-property/ ralink,eeprom;
-	ralink,mtd-eeprom = <&factory 0x0>;
+	/* v7：校准数据直接从原厂 factory 分区提取（512 字节），烘进镜像
+	   /lib/firmware/soc_wmac.eeprom。WLAN MAC 8c:88:4b:00:53:8a 与本机实测一致。
+	   这样无线不再依赖 flash 里的 factory 分区——即使 factory 被误擦，
+	   或 Breed 刷错布局覆盖了 mtd2，无线依然能起来。
+	   dtsi 默认属性 ralink,eeprom = "soc_wmac.eeprom" 已被保留，
+	   这里只需把 mtd 通道删掉，驱动就会走固件文件通道。 */
+	/delete-property/ ralink,mtd-eeprom;
 };
 
 &sdhci {
@@ -233,10 +234,22 @@ config wifi-iface 'default_radio0'
 	option disabled '0'
 WIFIEOF
 
+# v7：把原厂 factory 分区里的无线校准数据烘进镜像（/lib/firmware/soc_wmac.eeprom）
+# 数据来源：原厂 dump 百米生活.bin @0x40000 起 0x200 字节
+#   WLAN MAC 8c:88:4b:00:53:8a（= 本机 phy0-ap0 实测 addr），ETH MAC 8c:88:4b:00:53:88
+#   md5(512字节) = 6b409897e68203b323fd0bbe25aefe74
+mkdir -p "$SRC/files/lib/firmware" "$SRC/files/etc"
+cat > "$SRC/files/lib/firmware/soc_wmac.eeprom.b64" << 'CALEOF'
+IHYFAYyISwBTiv///////////////////////////////////////4yISwBTiIyISwBTiSIMBMD//x4BVXeoqoyI//8KAAAAAAAAAAAA/////xAQDw8ODg4ODw8PDw8PExMTEhISEhMTFBQUFBSA////gP///wAA/////////////////////////////////////////////////////////////////////////////////////////////////////////////////////yD/////////////////CAgICAQABwcEAAgIBAAHBwQA//////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////8=
+CALEOF
+base64 -d "$SRC/files/lib/firmware/soc_wmac.eeprom.b64" > "$SRC/files/lib/firmware/soc_wmac.eeprom"
+rm -f "$SRC/files/lib/firmware/soc_wmac.eeprom.b64"
+echo "烘入校准文件 $(wc -c < "$SRC/files/lib/firmware/soc_wmac.eeprom") 字节"
+
 # 版本标记：浏览器打开 http://192.168.1.1/ver.txt 就能确认烧进去的是哪一版
 mkdir -p "$SRC/files/www"
 cat > "$SRC/files/www/ver.txt" << 'VEREOF'
-HD51 v6
+HD51 v7
 build: 2026-11-15
 dts: /delete-property/ ralink,eeprom + ralink,mtd-eeprom = <&factory 0x0>
 wireless: baked (/etc/config/wireless, radio0, SSID HD51, open)
@@ -245,7 +258,7 @@ VEREOF
 
 cat > "$SRC/files/etc/uci-defaults/99-hd51-basic" << 'EOF'
 #!/bin/sh
-uci -q set system.@system[0].hostname='HD51-v6' || true
+uci -q set system.@system[0].hostname='HD51-v7' || true
 uci -q set system.@system[0].timezone='CST-8' || true
 uci -q set system.@system[0].zonename='Asia/Shanghai' || true
 uci -q commit system
