@@ -1,5 +1,5 @@
 #!/bin/bash
-# 连乐2 v7 = v4（实机验证稳定） + 今早实测结论
+# 连乐2 v8 = v7 功能不变，但启动路径退回 v4 原文（rc.local/rc.button 与 v4 逐字一致）
 # 实测结论：VLAN1 ports "0 1 2 3 4"、各口 pvid 1；LED 节点 green:signal1/2/3；
 #           br-lan = eth0 + eth1 + phy0-ap0；IP 192.168.1.1；工具路径已核对
 # 保持 v4 的“开机自愈”：sleep 5 + ip link set eth0/eth1 master br-lan + swconfig 兜底
@@ -200,37 +200,44 @@ echo "对比两段，值变了的那行就是复位键"
 EOF
 chmod +x "$SRC/files/usr/bin/btn-scan"
 
-# ---------- 7.5 复位键（带三重保护，绝不在开机阶段动配置） ----------
+# ---------- 7.5 复位键 = OpenWrt 官方原版（v4 实测可用，不自行改写） ----------
 mkdir -p "$SRC/files/etc/rc.button"
 cat > "$SRC/files/etc/rc.button/reset" << 'RBEOF'
 #!/bin/sh
-FLAG=/tmp/le2-reset-flag
-UP=$(cut -d. -f1 /proc/uptime)
+
+. /lib/functions.sh
+
+OVERLAY="$( grep ' /overlay ' /proc/mounts )"
+
 case "$ACTION" in
-press|pressed)
-	[ "$UP" -lt 180 ] && exit 0
-	echo "$UP" > "$FLAG"
-	logger -t le2-btn "press @${UP}s"
-	;;
+pressed)
+	[ -z "$OVERLAY" ] && return 0
+
+	return 5
+;;
 timeout)
-	[ -f "$FLAG" ] || exit 0
-	logger -t le2-btn "hold -> firstboot"
-	rm -f "$FLAG"
-	firstboot -y
-	reboot
-	;;
-release|released)
-	[ -f "$FLAG" ] || exit 0
-	T=$(cat "$FLAG" 2>/dev/null); rm -f "$FLAG"
-	[ -z "$T" ] && exit 0
-	[ "$UP" -le "$((T + 3))" ] && { logger -t le2-btn "short -> reboot"; reboot; }
-	;;
+	. /etc/diag.sh
+	set_state failsafe
+;;
+released)
+	if [ "$SEEN" -lt 1 ]
+	then
+		echo "REBOOT" > /dev/console
+		sync
+		reboot
+	elif [ "$SEEN" -ge 5 -a -n "$OVERLAY" ]
+	then
+		echo "FACTORY RESET" > /dev/console
+		jffs2reset -y && reboot &
+	fi
+;;
 esac
-exit 0
+
+return 0
 RBEOF
 chmod +x "$SRC/files/etc/rc.button/reset"
 
-# ---------- 8. rc.local（保留 v4 自愈逻辑，只追加点灯） ----------
+# ---------- 8. rc.local = v4 原文 + LED 延迟后台点灯 ----------
 cat > "$SRC/files/etc/rc.local" << 'EOF'
 #!/bin/sh
 sleep 5
@@ -239,32 +246,34 @@ for i in eth0 eth1; do
 done
 swconfig dev switch0 set enable_vlan 1 2>/dev/null
 swconfig dev switch0 vlan 1 set ports "0 1 2 3 4" 2>/dev/null
-L=/sys/class/leds
-if [ -d "$L/green:signal1" ]; then
-	echo netdev > "$L/green:signal1/trigger" 2>/dev/null
-	echo eth0 > "$L/green:signal1/device_name" 2>/dev/null
-	echo 1 > "$L/green:signal1/link" 2>/dev/null
-	echo 0 > "$L/green:signal1/tx" 2>/dev/null
-	echo 0 > "$L/green:signal1/rx" 2>/dev/null
-fi
-if [ -d "$L/green:signal2" ]; then
-	echo netdev > "$L/green:signal2/trigger" 2>/dev/null
-	echo eth0 > "$L/green:signal2/device_name" 2>/dev/null
-	echo 1 > "$L/green:signal2/tx" 2>/dev/null
-	echo 1 > "$L/green:signal2/rx" 2>/dev/null
-	echo 0 > "$L/green:signal2/link" 2>/dev/null
-fi
-if [ -d "$L/green:signal3" ]; then
-	echo none > "$L/green:signal3/trigger" 2>/dev/null
-	echo 0 > "$L/green:signal3/brightness" 2>/dev/null
-fi
-
 { echo "=== swconfig ==="; swconfig dev switch0 show 2>&1;
   echo "=== brctl ==="; brctl show 2>&1;
-  echo "=== links ==="; for i in eth0 eth1; do echo "$i: $(cat /sys/class/net/$i/operstate 2>/dev/null) $(cat /sys/class/net/$i/speed 2>/dev/null)"; done;
-  echo "=== wireless ==="; iw dev 2>&1;
-  echo "=== logread net ==="; logread 2>/dev/null | grep -iE "netifd|hostapd|wpa|switch" | tail -30;
+  echo "=== speed ==="; cat /sys/class/net/eth0/speed /sys/class/net/eth1/speed 2>&1;
   echo "=== network ==="; cat /etc/config/network 2>&1; } > /www/diag-net.txt 2>&1
+
+# LED 点灯放到开机 20 秒后的后台子进程里，绝不影响启动
+(
+	sleep 20
+	L=/sys/class/leds
+	if [ -e "$L/green:signal1" ]; then
+		echo netdev > "$L/green:signal1/trigger" 2>/dev/null || true
+		echo eth0 > "$L/green:signal1/device_name" 2>/dev/null || true
+		echo 1 > "$L/green:signal1/link" 2>/dev/null || true
+		echo 0 > "$L/green:signal1/tx" 2>/dev/null || true
+		echo 0 > "$L/green:signal1/rx" 2>/dev/null || true
+	fi
+	if [ -e "$L/green:signal2" ]; then
+		echo netdev > "$L/green:signal2/trigger" 2>/dev/null || true
+		echo eth0 > "$L/green:signal2/device_name" 2>/dev/null || true
+		echo 1 > "$L/green:signal2/tx" 2>/dev/null || true
+		echo 1 > "$L/green:signal2/rx" 2>/dev/null || true
+		echo 0 > "$L/green:signal2/link" 2>/dev/null || true
+	fi
+	if [ -e "$L/green:signal3" ]; then
+		echo none > "$L/green:signal3/trigger" 2>/dev/null || true
+		echo 0 > "$L/green:signal3/brightness" 2>/dev/null || true
+	fi
+) >/dev/null 2>&1 &
 exit 0
 EOF
 chmod +x "$SRC/files/etc/rc.local"
