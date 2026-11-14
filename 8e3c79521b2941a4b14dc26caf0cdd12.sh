@@ -222,6 +222,7 @@ config wifi-device 'radio0'
 	option htmode 'HT20'
 	option country 'CN'
 	option disabled '0'
+	option path 'platform/10180000.wmac'
 
 config wifi-iface 'default_radio0'
 	option device 'radio0'
@@ -261,8 +262,13 @@ if [ -f /etc/config/wireless ]; then
 	done
 	uci -q set wireless.radio0.disabled='0' || true
 	uci -q set wireless.radio0.country='CN' || true
-	uci -q set wireless.radio1.disabled='0' || true
-	uci -q set wireless.radio1.country='CN' || true
+	# 不再对 radio1 做任何 uci set（对不存在的命名段 set 会凭空造出重复 radio）
+	# 收尾：删掉自动探测多出来的重复 wifi-device，只保留 radio0
+	for s in $(uci -q show wireless | sed -n 's/^wireless\.\(radio[0-9]*\)=wifi-device$/\1/p'); do
+		[ "$s" = "radio0" ] && continue
+		uci -q delete wireless.$s || true
+		uci -q delete wireless.default_$s || true
+	done
 	uci -q commit wireless
 fi
 
