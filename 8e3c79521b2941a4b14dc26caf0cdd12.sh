@@ -114,13 +114,10 @@ cat > "$SRC/target/linux/ramips/dts/mt7620a_qianmi_hd51.dts" << 'EOF'
 };
 
 &wmac {
-	/* v8：回到实测能工作的方式——从 flash 的 factory 分区读校准。
-	   v5 的 dmesg 实测：rt2800_wmac 10180000.wmac: loaded eeprom from mtd device "factory"
-	   → RT6352/RF7620 识别成功 → phy0-ap0 建立 → 手机拿到 192.168.1.242 / 144Mbps。
-	   v7 把这条删掉改走 /lib/firmware/soc_wmac.eeprom 文件通道，结果无广播，
-	   说明文件通道在这颗芯片上不可靠，回归 mtd。
-	   同时镜像里仍然保留烘入的 /lib/firmware/soc_wmac.eeprom 作为备份。 */
-	ralink,mtd-eeprom = <&factory 0x0>;
+	/* v9：校准走固件文件通道（已由 v7 实机验证：radio0 显示 MediaTek MT7620、
+	   手机连上 192.168.1.242、Rx 104Mbit/s MCS13）。数据烘在
+	   /lib/firmware/soc_wmac.eeprom，512 字节，取自原厂 factory 分区。 */
+	/delete-property/ ralink,mtd-eeprom;
 };
 
 &sdhci {
@@ -134,6 +131,26 @@ cat > "$SRC/target/linux/ramips/dts/mt7620a_qianmi_hd51.dts" << 'EOF'
 };
 EOF
 echo "==> DTS 已写入"
+
+# ---------- 1b. 补 root=：Breed 不传 root，写 flash 的系统必挂 ----------
+# 实测 /proc/cmdline 只有 console=ttyS0,57600 rootfstype=squashfs,jffs2，没有 root=
+# 内核里已确认带 bootargs-append 支持（OpenWrt 314-MIPS-add-bootargs-override-property.patch）
+# mtdsplit(denx,uimage) 把 firmware 切成 kernel=mtd4、rootfs=mtd5，故 root 指向 mtdblock5
+DTSI="$SRC/target/linux/ramips/dts/mt7620a.dtsi"
+python3 - "$DTSI" << 'PY2'
+import sys, re
+p = sys.argv[1]
+s = open(p).read()
+if 'bootargs-append' in s:
+    print('dtsi 已有 bootargs-append，跳过'); sys.exit(0)
+s2 = s.replace(
+    'bootargs = "console=ttyS0,57600";',
+    'bootargs = "console=ttyS0,57600";\n\t\tbootargs-append = " root=/dev/mtdblock5 rootfstype=squashfs,jffs2 rootwait";', 1)
+if s2 == s:
+    print('!! 未匹配到 bootargs 行，bootargs-append 未加'); sys.exit(1)
+open(p, 'w').write(s2)
+print('dtsi 已加 bootargs-append -> root=/dev/mtdblock5')
+PY2
 
 # ---------- 2. 设备定义 ----------
 GMK="$SRC/target/linux/ramips/image/mt7620.mk"
@@ -249,7 +266,7 @@ echo "烘入校准文件 $(wc -c < "$SRC/files/lib/firmware/soc_wmac.eeprom") �
 # 版本标记：浏览器打开 http://192.168.1.1/ver.txt 就能确认烧进去的是哪一版
 mkdir -p "$SRC/files/www"
 cat > "$SRC/files/www/ver.txt" << 'VEREOF'
-HD51 v8
+HD51 v9
 build: 2026-11-15
 dts: /delete-property/ ralink,eeprom + ralink,mtd-eeprom = <&factory 0x0>
 wireless: baked (/etc/config/wireless, radio0, SSID HD51, open)
@@ -258,7 +275,7 @@ VEREOF
 
 cat > "$SRC/files/etc/uci-defaults/99-hd51-basic" << 'EOF'
 #!/bin/sh
-uci -q set system.@system[0].hostname='HD51-v8' || true
+uci -q set system.@system[0].hostname='HD51-v9' || true
 uci -q set system.@system[0].timezone='CST-8' || true
 uci -q set system.@system[0].zonename='Asia/Shanghai' || true
 uci -q commit system
