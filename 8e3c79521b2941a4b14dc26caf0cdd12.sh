@@ -1,6 +1,8 @@
 #!/bin/bash
-# 连乐2 v6：保留 v5 全部功能（工具、nodogsplash、luci-app-commands、复位键、三格灯）
-# 只去掉两个启动期风险点：switch0 reset=1、rc.local 里强设 swconfig
+# 连乐2 v7 = v4（实机验证稳定） + 今早实测结论
+# 实测结论：VLAN1 ports "0 1 2 3 4"、各口 pvid 1；LED 节点 green:signal1/2/3；
+#           br-lan = eth0 + eth1 + phy0-ap0；IP 192.168.1.1；工具路径已核对
+# 保持 v4 的“开机自愈”：sleep 5 + ip link set eth0/eth1 master br-lan + swconfig 兜底
 set -e
 
 WS="${GITHUB_WORKSPACE:-$(cd .. && pwd)}"
@@ -39,9 +41,9 @@ add_cfg CONFIG_PACKAGE_nodogsplash
 add_cfg CONFIG_PACKAGE_luci-app-commands
 add_cfg CONFIG_PACKAGE_iperf3
 sed -i '/CONFIG_PACKAGE_luci-network=y/d; /CONFIG_PACKAGE_luci-system=y/d' "$CFG" 2>/dev/null || true
-echo "==> .config 已补包（含 nodogsplash / luci-app-commands）"
+echo "==> .config 已补包"
 
-# ---------- 3. 设备定义 ----------
+# ---------- 3. 设备定义：补 SUPPORTED_DEVICES ----------
 GMK="$SRC/target/linux/ath79/image/generic.mk"
 if grep -q "^define Device/lelink_le2$" "$GMK"; then
 	sed -i '/^define Device\/lelink_le2$/,/^TARGET_DEVICES += lelink_le2$/d' "$GMK"
@@ -49,6 +51,7 @@ fi
 cat >> "$GMK" << 'EOF'
 
 # 连乐2：沿用上游乐视 LBA-047-CH 的 DTS 与 OKLI 引导方案
+# 交换机端口：0=CPU(AR8228)，1/2 空，3/4 为两个物理网口
 define Device/lelink_le2
   $(Device/loader-okli-uimage)
   SOC := qca9531
@@ -68,26 +71,31 @@ define Device/lelink_le2
 endef
 TARGET_DEVICES += lelink_le2
 EOF
-echo "==> 设备定义已写入"
+echo "==> 设备定义已写入（含 SUPPORTED_DEVICES）"
 
-# ---------- 4. DTS：LED 14/15/16 高有效 ----------
+# ---------- 4. 改 DTS：LED 用实测的 14/15/16，高电平有效 ----------
 DTS="$SRC/target/linux/ath79/dts/qca9531_letv_lba-047-ch.dts"
 [ -f "$DTS" ] || { echo "!! 找不到 DTS"; exit 1; }
 python3 - "$DTS" << 'PY'
-import subprocess,sys
-p=sys.argv[1]; s=open(p).read()
+import re,sys
+p=sys.argv[1]
+s=open(p).read()
+# LED0: 13 -> 14，高有效；LED1: 4 -> 15；LED2: 11 -> 16
 s=s.replace('<&gpio 13 GPIO_ACTIVE_LOW>','<&gpio 14 GPIO_ACTIVE_HIGH>')
 s=s.replace('<&gpio 4 GPIO_ACTIVE_LOW>','<&gpio 15 GPIO_ACTIVE_HIGH>')
 s=s.replace('<&gpio 11 GPIO_ACTIVE_LOW>','<&gpio 16 GPIO_ACTIVE_HIGH>')
+# 名字改成信号格
 s=s.replace('label = "blue:status"','label = "green:signal1"')
 s=s.replace('label = "green:status"','label = "green:signal2"')
 s=s.replace('label = "red:status"','label = "green:signal3"')
 open(p,'w').write(s)
+# 校验
+import subprocess
 print(subprocess.run(['grep','-n','gpios',p],capture_output=True,text=True).stdout)
 PY
 echo "==> DTS 已改"
 
-# ---------- 5. 网络：两口同属 VLAN1 / br-lan（只写一次，不含 reset） ----------
+# ---------- 5. 网络：交换机全口 0 1 2 3 4（3/4 才是物理网口） ----------
 mkdir -p "$SRC/files/etc/uci-defaults"
 cat > "$SRC/files/etc/uci-defaults/99-le2-net" << 'EOF'
 #!/bin/sh
@@ -106,6 +114,7 @@ u add_list network.@device[-1].ports='eth0'
 u add_list network.@device[-1].ports='eth1'
 u add network switch
 u set network.@switch[-1].name='switch0'
+u set network.@switch[-1].reset='1'
 u set network.@switch[-1].enable_vlan='1'
 u add network switch_vlan
 u set network.@switch_vlan[-1].device='switch0'
@@ -122,7 +131,7 @@ exit 0
 EOF
 chmod +x "$SRC/files/etc/uci-defaults/99-le2-net"
 
-# ---------- 6. WiFi / 时区 ----------
+# ---------- 6. WiFi / 时区 / nodogsplash ----------
 cat > "$SRC/files/etc/uci-defaults/99-le2-wifi" << 'EOF'
 #!/bin/sh
 [ -f /etc/config/wireless ] || wifi config >/dev/null 2>&1
@@ -136,53 +145,100 @@ if [ -f /etc/config/wireless ]; then
 fi
 exit 0
 EOF
+chmod +x "$SRC/files/etc/uci-defaults/99-le2-wifi"
+
 cat > "$SRC/files/etc/uci-defaults/99-le2-tz" << 'EOF'
 #!/bin/sh
 uci -q set system.@system[0].timezone='CST-8' || true
 uci -q set system.@system[0].zonename='Asia/Shanghai' || true
 uci -q set system.@system[0].ntp='1' || true
+uci -q set system.ntp='timeserver' || true
 uci -q commit system
+[ -x /etc/init.d/nodogsplash ] && /etc/init.d/nodogsplash disable 2>/dev/null
 exit 0
 EOF
-chmod +x "$SRC/files/etc/uci-defaults/99-le2-wifi" "$SRC/files/etc/uci-defaults/99-le2-tz"
+chmod +x "$SRC/files/etc/uci-defaults/99-le2-tz"
 
-# ---------- 7. 复位键：带三重保护的版本 ----------
-# 保护1：开机 120 秒内不响应（避免启动阶段误判成"长按"）
-# 保护2：只有内核报 timeout（真按住）才 firstboot；release 分支绝不清配置
-# 保护3：每次动作都写 logger，事后可查
+# ---------- 7. GPIO 扫描工具 ----------
+mkdir -p "$SRC/files/usr/bin"
+cat > "$SRC/files/usr/bin/led-scan" << 'EOF'
+#!/bin/sh
+G=/sys/class/gpio
+[ -d $G ] || { echo "no $G"; exit 1; }
+echo "扫描 GPIO 0-22，每个亮 2 秒，记录亮灯编号（14/15/16 是信号灯，已被占用会跳过）"
+for i in 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22; do
+	echo $i > $G/export 2>/dev/null || continue
+	echo out > $G/gpio$i/direction 2>/dev/null || { echo $i > $G/unexport; continue; }
+	echo 1 > $G/gpio$i/value 2>/dev/null
+	echo "===== GPIO $i ====="
+	sleep 2
+	echo 0 > $G/gpio$i/value 2>/dev/null
+	echo $i > $G/unexport 2>/dev/null
+done
+EOF
+chmod +x "$SRC/files/usr/bin/led-scan"
+
+cat > "$SRC/files/usr/bin/btn-scan" << 'EOF'
+#!/bin/sh
+# 简化版：先打印全部输入电平，再提示按键，第二次打印，靠肉眼比对
+G=/sys/class/gpio
+L="0 1 2 3 4 5 6 7 8 9 10 11 12 13 17 18 19 20 21 22"
+scan() {
+	for i in $L; do
+		echo $i > $G/export 2>/dev/null
+		echo in > $G/gpio$i/direction 2>/dev/null || continue
+		echo "G$i=$(cat $G/gpio$i/value 2>/dev/null)"
+	done
+}
+echo "----- 未按下 -----"
+scan
+echo "----- 现在按住复位键 10 秒 -----"
+sleep 10
+echo "----- 按住中 -----"
+scan
+echo "对比两段，值变了的那行就是复位键"
+EOF
+chmod +x "$SRC/files/usr/bin/btn-scan"
+
+# ---------- 7.5 复位键（带三重保护，绝不在开机阶段动配置） ----------
 mkdir -p "$SRC/files/etc/rc.button"
-cat > "$SRC/files/etc/rc.button/reset" << 'EOF'
+cat > "$SRC/files/etc/rc.button/reset" << 'RBEOF'
 #!/bin/sh
 FLAG=/tmp/le2-reset-flag
 UP=$(cut -d. -f1 /proc/uptime)
 case "$ACTION" in
 press|pressed)
-	[ "$UP" -lt 120 ] && exit 0
+	[ "$UP" -lt 180 ] && exit 0
 	echo "$UP" > "$FLAG"
 	logger -t le2-btn "press @${UP}s"
 	;;
 timeout)
 	[ -f "$FLAG" ] || exit 0
-	logger -t le2-btn "长按：恢复出厂"
+	logger -t le2-btn "hold -> firstboot"
 	rm -f "$FLAG"
 	firstboot -y
 	reboot
 	;;
 release|released)
 	[ -f "$FLAG" ] || exit 0
-	T=$(cat "$FLAG" 2>/dev/null)
-	rm -f "$FLAG"
+	T=$(cat "$FLAG" 2>/dev/null); rm -f "$FLAG"
 	[ -z "$T" ] && exit 0
-	[ "$UP" -le "$((T + 4))" ] && { logger -t le2-btn "短按：重启"; reboot; }
+	[ "$UP" -le "$((T + 3))" ] && { logger -t le2-btn "short -> reboot"; reboot; }
 	;;
 esac
 exit 0
-EOF
+RBEOF
 chmod +x "$SRC/files/etc/rc.button/reset"
 
-# ---------- 8. rc.local：只点灯 + 落诊断，不改交换芯片 ----------
+# ---------- 8. rc.local（保留 v4 自愈逻辑，只追加点灯） ----------
 cat > "$SRC/files/etc/rc.local" << 'EOF'
 #!/bin/sh
+sleep 5
+for i in eth0 eth1; do
+	ip link set $i master br-lan 2>/dev/null || true
+done
+swconfig dev switch0 set enable_vlan 1 2>/dev/null
+swconfig dev switch0 vlan 1 set ports "0 1 2 3 4" 2>/dev/null
 L=/sys/class/leds
 if [ -d "$L/green:signal1" ]; then
 	echo netdev > "$L/green:signal1/trigger" 2>/dev/null
@@ -215,13 +271,10 @@ chmod +x "$SRC/files/etc/rc.local"
 
 # ---------- 9. 自检 ----------
 echo "---- 设备定义 ----"; grep -A 16 'define Device/lelink_le2' "$GMK"
-echo "---- DTS LED ----"; grep -n "gpios = <&gpio" "$DTS"
+echo "---- DTS LED ----"; grep -n -B1 "GPIO_ACTIVE_HIGH\|gpios = <&gpio 17" "$DTS"
+echo "---- 包 ----"; grep -E 'PACKAGE_iperf3|PACKAGE_hcxdumptool|PACKAGE_reaver|PACKAGE_nodogsplash|PACKAGE_luci-app-commands' "$CFG"
 echo "---- 启动脚本语法 ----"
-for f in "$SRC/files/etc/rc.button/reset" "$SRC/files/etc/rc.local" \
-         "$SRC/files/etc/uci-defaults/99-le2-net" "$SRC/files/etc/uci-defaults/99-le2-wifi" \
-         "$SRC/files/etc/uci-defaults/99-le2-tz"; do
+for f in "$SRC/files/etc/rc.local" "$SRC/files/etc/rc.button/reset" "$SRC/files/etc/uci-defaults/99-le2-net"; do
 	if sh -n "$f"; then echo "ok $(basename $f)"; else echo "!! 语法错误 $(basename $f)"; fi
 done
-echo "---- 确认已无 switch reset ----"
-grep -q "reset='1'" "$SRC/files/etc/uci-defaults/99-le2-net" && echo "!! 仍存在" || echo "（已移除）"
 echo "==> 完成"
