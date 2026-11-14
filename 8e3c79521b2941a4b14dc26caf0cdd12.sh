@@ -1,5 +1,5 @@
 #!/bin/bash
-# 百米 HD51 v4：补 kmod-mt7620（v3 漏了它 → 板载 2.4G 从未起来 → 无 Wi-Fi 广播）
+# 百米 HD51 v5：修 2.4G 不广播（wmac 校准数据改正）+ 打开 SDHCI + 无线配置烘进镜像
 # 百米 HD51 自检版：MT7620A + 128MB + 16MB(MX25L12835E) + 百兆 5 口 + USB + PCIe/5G 探测
 # 复位键 GPIO13（原厂 /etc/init.d/boot:61 `btnd reset 13`）
 # 依据原厂 16MB dump 实测分区：u-boot 0x0/0x30000, env 0x30000/0x10000,
@@ -69,7 +69,7 @@ cat > "$SRC/target/linux/ramips/dts/mt7620a_qianmi_hd51.dts" << 'EOF'
 				read-only;
 			};
 
-			partition@40000 {
+			factory: partition@40000 {
 				label = "factory";
 				reg = <0x40000 0x10000>;
 				read-only;
@@ -114,8 +114,20 @@ cat > "$SRC/target/linux/ramips/dts/mt7620a_qianmi_hd51.dts" << 'EOF'
 };
 
 &wmac {
-	nvmem-cells = <&eeprom_factory_0>;
-	nvmem-cell-names = "eeprom";
+	/* v5 关键修复：校准数据从 flash 的 factory 分区读，而不是去找固件文件。
+	   dtsi 默认给的是 ralink,eeprom = "soc_wmac.eeprom" 字符串，rt2x00lib 会去
+	   request_firmware 找 /lib/firmware/soc_wmac.eeprom —— 这个文件根本不存在，
+	   于是报 "Failed to request EEPROM" / "Error - Failed to read EEPROM file"，
+	   probe 失败 → 没有 wireless phy → 没有任何广播。
+	   rt2x00lib.ko 里实测存在字符串 "ralink,mtd-eeprom" 与
+	   "loaded eeprom from mtd device %s"，说明这条通道是支持的。 */
+	ralink,mtd-eeprom = <&factory 0x0>;
+};
+
+&sdhci {
+	/* mt7620A 自带 SD 主机控制器（OpenWrt 有 830-mmc 补丁支持），
+	   dtsi 里默认 disabled，这里打开，卡槽若是走 SDHCI 就能直接识卡 */
+	status = "okay";
 };
 
 &pcie {
@@ -137,7 +149,7 @@ define Device/qianmi_hd51
   DEVICE_VENDOR := Qianmi
   DEVICE_MODEL := HD51
   DEVICE_DTS := mt7620a_qianmi_hd51
-  DEVICE_PACKAGES := kmod-mt7620 kmod-mt76x0e kmod-mt76x2 kmod-usb2 kmod-usb-ohci \
+  DEVICE_PACKAGES := kmod-rt2800-soc kmod-mt76x0e kmod-mt76x2 kmod-usb2 kmod-usb-ohci \
 	kmod-usb-storage kmod-fs-exfat kmod-fs-vfat
   SUPPORTED_DEVICES += qianmi,hd51 hd51
 endef
@@ -202,6 +214,26 @@ config interface 'lan'
 	option ip6assign '60'
 NETEOF
 
+# v5：无线配置直接烘进镜像，不再依赖首次开机时 `wifi config` 是否能探到 phy。
+# 这样即使 phy 命名的先后顺序不同，hostapd 也有确定的配置可用。
+cat > "$SRC/files/etc/config/wireless" << 'WIFIEOF'
+config wifi-device 'radio0'
+	option type 'mac80211'
+	option channel '1'
+	option band '2g'
+	option htmode 'HT20'
+	option country 'CN'
+	option disabled '0'
+
+config wifi-iface 'default_radio0'
+	option device 'radio0'
+	option network 'lan'
+	option mode 'ap'
+	option ssid 'HD51'
+	option encryption 'none'
+	option disabled '0'
+WIFIEOF
+
 cat > "$SRC/files/etc/uci-defaults/99-hd51-basic" << 'EOF'
 #!/bin/sh
 uci -q set system.@system[0].hostname='HD51' || true
@@ -209,6 +241,7 @@ uci -q set system.@system[0].timezone='CST-8' || true
 uci -q set system.@system[0].zonename='Asia/Shanghai' || true
 uci -q commit system
 
+# 兜底：万一 phy 不在 radio0 上，按探测结果补一次
 [ -f /etc/config/wireless ] || wifi config >/dev/null 2>&1
 if [ -f /etc/config/wireless ]; then
 	for i in 0 1 2 3; do
@@ -224,6 +257,9 @@ if [ -f /etc/config/wireless ]; then
 	uci -q set wireless.radio1.country='CN' || true
 	uci -q commit wireless
 fi
+
+# 兜底登录通道：SSH 密码 hd51（网页/串口都连不上时的最后手段）
+printf 'hd51\nhd51\n' | passwd root >/dev/null 2>&1 || true
 exit 0
 EOF
 chmod +x "$SRC/files/etc/uci-defaults/99-hd51-basic"
