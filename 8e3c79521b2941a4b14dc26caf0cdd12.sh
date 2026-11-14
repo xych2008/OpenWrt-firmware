@@ -1,160 +1,188 @@
 #!/bin/bash
-# 连乐2 v9 = v8 功能不变 + 三项抗卡死加固
-#   1) 内核 panic=10：若卡住实为 panic，10 秒自动重启重试（有机会自愈）
-#   2) /etc/config/network 直接烘进镜像（不再依赖 uci-defaults 首启生成，少一步）
-#   3) 开机自记录 /etc/le2-boot.log：留存每次启动时间与异常，便于事后取证
-# 说明：断电冷启动的电源时序问题属硬件，固件层面无法根治；以上是能做的部分。
-# 以下为 v8 原始说明：启动路径退回 v4 原文（rc.local/rc.button 与 v4 逐字一致）
-# 实测结论：VLAN1 ports "0 1 2 3 4"、各口 pvid 1；LED 节点 green:signal1/2/3；
-#           br-lan = eth0 + eth1 + phy0-ap0；IP 192.168.1.1；工具路径已核对
-# 保持 v4 的“开机自愈”：sleep 5 + ip link set eth0/eth1 master br-lan + swconfig 兜底
+# 百米 HD51 v4：补 kmod-mt7620（v3 漏了它 → 板载 2.4G 从未起来 → 无 Wi-Fi 广播）
+# 百米 HD51 自检版：MT7620A + 128MB + 16MB(MX25L12835E) + 百兆 5 口 + USB + PCIe/5G 探测
+# 复位键 GPIO13（原厂 /etc/init.d/boot:61 `btnd reset 13`）
+# 依据原厂 16MB dump 实测分区：u-boot 0x0/0x30000, env 0x30000/0x10000,
+# factory 0x40000/0x40000(0x200 校准), firmware 0x80000/0x6F0000, data 0x770000/0x890000
 set -e
 
 WS="${GITHUB_WORKSPACE:-$(cd .. && pwd)}"
-if [ -d "target/linux/ath79" ]; then
+if [ -d "target/linux/ramips" ]; then
 	SRC="$(pwd)"
 else
 	SRC="$WS/openwrt"
 fi
-[ -d "$SRC/target/linux/ath79" ] || { echo "!! 找不到源码树"; exit 1; }
+[ -d "$SRC/target/linux/ramips" ] || { echo "!! 找不到 ramips 源码树"; exit 1; }
 
-# ---------- 1. 屏蔽旧 diy-part2.sh ----------
-cat > "$WS/diy-part2.sh" << 'EOS'
-#!/bin/bash
-exit 0
-EOS
-chmod +x "$WS/diy-part2.sh"
+# ---------- 1. DTS ----------
+cat > "$SRC/target/linux/ramips/dts/mt7620a_qianmi_hd51.dts" << 'EOF'
+// SPDX-License-Identifier: GPL-2.0-or-later OR MIT
 
-# ---------- 2. .config ----------
-CFG="$WS/.config"
-add_cfg() { grep -q "^$1=y" "$CFG" 2>/dev/null || echo "$1=y" >> "$CFG"; }
-add_cfg CONFIG_PACKAGE_luci
-add_cfg CONFIG_PACKAGE_luci-base
-add_cfg CONFIG_PACKAGE_luci-i18n-base-zh-cn
-add_cfg CONFIG_PACKAGE_wpad-basic-mbedtls
-add_cfg CONFIG_PACKAGE_kmod-ath9k
-add_cfg CONFIG_PACKAGE_iw
-add_cfg CONFIG_PACKAGE_bridge-utils
-add_cfg CONFIG_PACKAGE_aircrack-ng
-add_cfg CONFIG_PACKAGE_airmon-ng
-add_cfg CONFIG_PACKAGE_hcxdumptool
-add_cfg CONFIG_PACKAGE_hcxtools
-add_cfg CONFIG_PACKAGE_reaver
-add_cfg CONFIG_PACKAGE_pixiewps
-add_cfg CONFIG_PACKAGE_tmux
-add_cfg CONFIG_PACKAGE_nodogsplash
-add_cfg CONFIG_PACKAGE_luci-app-commands
-add_cfg CONFIG_PACKAGE_iperf3
-sed -i '/CONFIG_PACKAGE_luci-network=y/d; /CONFIG_PACKAGE_luci-system=y/d' "$CFG" 2>/dev/null || true
-echo "==> .config 已补包"
+#include "mt7620a.dtsi"
 
-# ---------- 3. 设备定义：补 SUPPORTED_DEVICES ----------
-GMK="$SRC/target/linux/ath79/image/generic.mk"
-if grep -q "^define Device/lelink_le2$" "$GMK"; then
-	sed -i '/^define Device\/lelink_le2$/,/^TARGET_DEVICES += lelink_le2$/d' "$GMK"
+#include <dt-bindings/gpio/gpio.h>
+#include <dt-bindings/input/input.h>
+#include <dt-bindings/leds/common.h>
+
+/ {
+	compatible = "qianmi,hd51", "ralink,mt7620a-soc";
+	model = "Qianmi HD51";
+
+	aliases {
+		label-mac-device = &ethernet;
+	};
+
+	keys {
+		compatible = "gpio-keys";
+
+		reset {
+			label = "reset";
+			gpios = <&gpio0 13 GPIO_ACTIVE_LOW>;
+			linux,code = <KEY_RESTART>;
+		};
+	};
+};
+
+&spi0 {
+	status = "okay";
+
+	flash@0 {
+		compatible = "jedec,spi-nor";
+		reg = <0>;
+		spi-max-frequency = <24000000>;
+		m25p,fast-read;
+
+		partitions {
+			compatible = "fixed-partitions";
+			#address-cells = <1>;
+			#size-cells = <1>;
+
+			partition@0 {
+				label = "u-boot";
+				reg = <0x0 0x30000>;
+				read-only;
+			};
+
+			partition@30000 {
+				label = "u-boot-env";
+				reg = <0x30000 0x10000>;
+				read-only;
+			};
+
+			partition@40000 {
+				label = "factory";
+				reg = <0x40000 0x10000>;
+				read-only;
+
+				nvmem-layout {
+					compatible = "fixed-layout";
+					#address-cells = <1>;
+					#size-cells = <1>;
+
+					eeprom_factory_0: eeprom@0 {
+						reg = <0x0 0x200>;
+					};
+
+					macaddr_factory_28: macaddr@28 {
+						reg = <0x28 0x6>;
+					};
+				};
+			};
+
+			partition@50000 {
+				compatible = "denx,uimage";
+				label = "firmware";
+				reg = <0x50000 0xfb0000>;
+			};
+		};
+	};
+};
+
+&ehci {
+	status = "okay";
+};
+
+&ohci {
+	status = "okay";
+};
+
+&ethernet {
+	nvmem-cells = <&macaddr_factory_28>;
+	nvmem-cell-names = "mac-address";
+
+	mediatek,portmap = "lllll";
+};
+
+&wmac {
+	nvmem-cells = <&eeprom_factory_0>;
+	nvmem-cell-names = "eeprom";
+};
+
+&pcie {
+	status = "okay";
+};
+EOF
+echo "==> DTS 已写入"
+
+# ---------- 2. 设备定义 ----------
+GMK="$SRC/target/linux/ramips/image/mt7620.mk"
+if grep -q "^define Device/qianmi_hd51$" "$GMK"; then
+	sed -i '/^define Device\/qianmi_hd51$/,/^TARGET_DEVICES += qianmi_hd51$/d' "$GMK"
 fi
 cat >> "$GMK" << 'EOF'
 
-# 连乐2：沿用上游乐视 LBA-047-CH 的 DTS 与 OKLI 引导方案
-# 交换机端口：0=CPU(AR8228)，1/2 空，3/4 为两个物理网口
-define Device/lelink_le2
-  $(Device/loader-okli-uimage)
-  SOC := qca9531
-  DEVICE_VENDOR := Lelink
-  DEVICE_MODEL := LE2
-  DEVICE_DTS := qca9531_letv_lba-047-ch
-  SUPPORTED_DEVICES := letv,lba-047-ch lelink,le2
-  DEVICE_PACKAGES := -uboot-envtools
-  FACTORY_SIZE := 14528k
-  IMAGE_SIZE := 15936k
-  LOADER_FLASH_OFFS := 0x50000
-  KERNEL := kernel-bin | append-dtb | lzma | uImage lzma -M 0x4f4b4c49
-  IMAGES := sysupgrade.bin factory.bin kernel.bin rootfs.bin
-  IMAGE/kernel.bin := append-loader-okli-uimage $(1) | pad-to 64k
-  IMAGE/rootfs.bin := append-kernel | pad-to $$$$(BLOCKSIZE) | append-rootfs | pad-rootfs | check-size $$$$(FACTORY_SIZE)
-  IMAGE/factory.bin := append-kernel | pad-to $$$$(BLOCKSIZE) | append-rootfs | pad-rootfs | pad-to 14876672 | append-loader-okli-uimage $(1)
+define Device/qianmi_hd51
+  SOC := mt7620a
+  IMAGE_SIZE := 16320k
+  DEVICE_VENDOR := Qianmi
+  DEVICE_MODEL := HD51
+  DEVICE_DTS := mt7620a_qianmi_hd51
+  DEVICE_PACKAGES := kmod-mt7620 kmod-mt76x0e kmod-mt76x2 kmod-usb2 kmod-usb-ohci \
+	kmod-usb-storage kmod-fs-exfat kmod-fs-vfat
+  SUPPORTED_DEVICES += qianmi,hd51 hd51
 endef
-TARGET_DEVICES += lelink_le2
+TARGET_DEVICES += qianmi_hd51
 EOF
-echo "==> 设备定义已写入（含 SUPPORTED_DEVICES）"
+echo "==> 设备定义已写入"
 
-# ---------- 4. 改 DTS：LED 用实测的 14/15/16，高电平有效 ----------
-DTS="$SRC/target/linux/ath79/dts/qca9531_letv_lba-047-ch.dts"
-[ -f "$DTS" ] || { echo "!! 找不到 DTS"; exit 1; }
-python3 - "$DTS" << 'PY'
-import re,sys
-p=sys.argv[1]
-s=open(p).read()
-# v9：bootargs 追加 panic=10（卡住若为 panic，10 秒后自动重启重试）
-s=s.replace('bootargs = "console=ttyS0,115200n8";','bootargs = "console=ttyS0,115200n8 panic=10";')
-# LED0: 13 -> 14，高有效；LED1: 4 -> 15；LED2: 11 -> 16
-s=s.replace('<&gpio 13 GPIO_ACTIVE_LOW>','<&gpio 14 GPIO_ACTIVE_HIGH>')
-s=s.replace('<&gpio 4 GPIO_ACTIVE_LOW>','<&gpio 15 GPIO_ACTIVE_HIGH>')
-s=s.replace('<&gpio 11 GPIO_ACTIVE_LOW>','<&gpio 16 GPIO_ACTIVE_HIGH>')
-# 名字改成信号格
-s=s.replace('label = "blue:status"','label = "green:signal1"')
-s=s.replace('label = "green:status"','label = "green:signal2"')
-s=s.replace('label = "red:status"','label = "green:signal3"')
-open(p,'w').write(s)
-# 校验
-import subprocess
-print(subprocess.run(['grep','-n','gpios',p],capture_output=True,text=True).stdout)
+# ---------- 3. 交换机：5 口全 LAN（AP/中继形态） ----------
+NET="$SRC/target/linux/ramips/mt7620/base-files/etc/board.d/02_network"
+[ -f "$NET" ] || { echo "!! 找不到 02_network"; exit 1; }
+python3 - "$NET" << 'PY'
+import sys
+p = sys.argv[1]
+s = open(p).read()
+if 'qianmi,hd51' in s:
+    print('已有 hd51 分支，跳过')
+    sys.exit(0)
+anchor = "\tasus,rp-n53)\n"
+block = (
+    "\tqianmi,hd51)\n"
+    "\t\tucidef_add_switch \"switch0\" \\\n"
+    "\t\t\t\"0:lan\" \"1:lan\" \"2:lan\" \"3:lan\" \"4:lan\" \"6@eth0\"\n"
+    "\t\t;;\n"
+)
+if anchor not in s:
+    print('!! 找不到插入锚点'); sys.exit(1)
+s = s.replace(anchor, block + anchor, 1)
+open(p, 'w').write(s)
+print('02_network 已插入 hd51 分支')
 PY
-echo "==> DTS 已改"
 
-# ---------- 5. 网络：交换机全口 0 1 2 3 4（3/4 才是物理网口） ----------
-mkdir -p "$SRC/files/etc/uci-defaults"
-cat > "$SRC/files/etc/uci-defaults/99-le2-net" << 'EOF'
-#!/bin/sh
-u() { uci -q "$@"; }
-u delete network.wan
-u delete network.wan6
-while u delete network.@switch_vlan[0]; do :; done
-while u delete network.@switch[0]; do :; done
-for i in 9 8 7 6 5 4 3 2 1 0; do
-	[ "$(u get network.@device[$i].name)" = "br-lan" ] && u delete network.@device[$i]
-done
-u add network device
-u set network.@device[-1].name='br-lan'
-u set network.@device[-1].type='bridge'
-u add_list network.@device[-1].ports='eth0'
-u add_list network.@device[-1].ports='eth1'
-u add network switch
-u set network.@switch[-1].name='switch0'
-u set network.@switch[-1].reset='1'
-u set network.@switch[-1].enable_vlan='1'
-u add network switch_vlan
-u set network.@switch_vlan[-1].device='switch0'
-u set network.@switch_vlan[-1].vlan='1'
-u set network.@switch_vlan[-1].ports='0 1 2 3 4'
-u set network.lan='interface'
-u set network.lan.device='br-lan'
-u set network.lan.proto='static'
-u set network.lan.ipaddr='192.168.1.1'
-u set network.lan.netmask='255.255.255.0'
-u set network.lan.ip6assign='60'
-u commit network
-exit 0
-EOF
-chmod +x "$SRC/files/etc/uci-defaults/99-le2-net"
-
-# ---------- 5.5 v9：network 配置直接烘进镜像（首启不再依赖 uci-defaults 生成） ----------
-mkdir -p "$SRC/files/etc/config"
-cat > "$SRC/files/etc/config/network" << 'EOF'
+# ---------- 4. 默认配置：中文 / 时区 / 开放热点 ----------
+mkdir -p "$SRC/files/etc/uci-defaults" "$SRC/files/etc/config"
+cat > "$SRC/files/etc/config/network" << 'NETEOF'
 config interface 'loopback'
 	option device 'lo'
 	option proto 'static'
 	option ipaddr '127.0.0.1'
 	option netmask '255.255.255.0'
 
-config globals 'globals'
-	option ula_prefix 'fd00:le2::/48'
-
 config device 'brlan'
 	option name 'br-lan'
 	option type 'bridge'
 	list ports 'eth0'
-	list ports 'eth1'
+	list ports 'eth0.1'
 
 config switch
 	option name 'switch0'
@@ -164,7 +192,7 @@ config switch
 config switch_vlan
 	option device 'switch0'
 	option vlan '1'
-	option ports '0 1 2 3 4'
+	option ports '0 1 2 3 4 6t'
 
 config interface 'lan'
 	option device 'br-lan'
@@ -172,169 +200,170 @@ config interface 'lan'
 	option ipaddr '192.168.1.1'
 	option netmask '255.255.255.0'
 	option ip6assign '60'
-EOF
-echo "==> network 已烘进镜像"
+NETEOF
 
-# ---------- 6. WiFi / 时区 / nodogsplash ----------
-cat > "$SRC/files/etc/uci-defaults/99-le2-wifi" << 'EOF'
+cat > "$SRC/files/etc/uci-defaults/99-hd51-basic" << 'EOF'
 #!/bin/sh
+uci -q set system.@system[0].hostname='HD51' || true
+uci -q set system.@system[0].timezone='CST-8' || true
+uci -q set system.@system[0].zonename='Asia/Shanghai' || true
+uci -q commit system
+
 [ -f /etc/config/wireless ] || wifi config >/dev/null 2>&1
 if [ -f /etc/config/wireless ]; then
+	for i in 0 1 2 3; do
+		uci -q set wireless.@wifi-iface[$i].ssid="HD51" || true
+		uci -q set wireless.@wifi-iface[$i].encryption='none' || true
+		uci -q set wireless.@wifi-iface[$i].network='lan' || true
+		uci -q set wireless.@wifi-iface[$i].disabled='0' || true
+		uci -q set wireless.@wifi-iface[$i].mode='ap' || true
+	done
 	uci -q set wireless.radio0.disabled='0' || true
-	uci -q set wireless.@wifi-iface[0].disabled='0' || true
-	uci -q set wireless.@wifi-iface[0].ssid='OpenWrt' || true
-	uci -q set wireless.@wifi-iface[0].encryption='none' || true
-	uci -q set wireless.@wifi-iface[0].network='lan' || true
+	uci -q set wireless.radio0.country='CN' || true
+	uci -q set wireless.radio1.disabled='0' || true
+	uci -q set wireless.radio1.country='CN' || true
 	uci -q commit wireless
 fi
 exit 0
 EOF
-chmod +x "$SRC/files/etc/uci-defaults/99-le2-wifi"
+chmod +x "$SRC/files/etc/uci-defaults/99-hd51-basic"
 
-cat > "$SRC/files/etc/uci-defaults/99-le2-tz" << 'EOF'
-#!/bin/sh
-uci -q set system.@system[0].timezone='CST-8' || true
-uci -q set system.@system[0].zonename='Asia/Shanghai' || true
-uci -q set system.@system[0].ntp='1' || true
-uci -q set system.ntp='timeserver' || true
-uci -q commit system
-[ -x /etc/init.d/nodogsplash ] && /etc/init.d/nodogsplash disable 2>/dev/null
-exit 0
-EOF
-chmod +x "$SRC/files/etc/uci-defaults/99-le2-tz"
+# ---------- 5. .config 里补包 ----------
+CFG="$WS/${CONFIG_FILE:-.config.hd51}"
+add_cfg() { grep -q "^$1=y" "$CFG" 2>/dev/null || echo "$1=y" >> "$CFG"; }
+add_cfg CONFIG_PACKAGE_luci
+add_cfg CONFIG_PACKAGE_luci-base
+add_cfg CONFIG_PACKAGE_luci-i18n-base-zh-cn
+add_cfg CONFIG_PACKAGE_wpad-basic-mbedtls
+add_cfg CONFIG_PACKAGE_iw
+add_cfg CONFIG_PACKAGE_iperf3
+add_cfg CONFIG_PACKAGE_luci-app-commands
+add_cfg CONFIG_PACKAGE_kmod-mt7620
+add_cfg CONFIG_PACKAGE_kmod-mt76x0e
+add_cfg CONFIG_PACKAGE_kmod-mt76x2
+add_cfg CONFIG_PACKAGE_kmod-usb2
+add_cfg CONFIG_PACKAGE_kmod-usb-ohci
+add_cfg CONFIG_PACKAGE_kmod-gpio-button-hotplug
+add_cfg CONFIG_PACKAGE_kmod-usb-storage
+add_cfg CONFIG_PACKAGE_kmod-fs-exfat
+echo "==> .config 已补包（$CFG）"
 
-# ---------- 7. GPIO 扫描工具 ----------
-mkdir -p "$SRC/files/usr/bin"
-cat > "$SRC/files/usr/bin/led-scan" << 'EOF'
-#!/bin/sh
-G=/sys/class/gpio
-[ -d $G ] || { echo "no $G"; exit 1; }
-echo "扫描 GPIO 0-22，每个亮 2 秒，记录亮灯编号（14/15/16 是信号灯，已被占用会跳过）"
-for i in 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22; do
-	echo $i > $G/export 2>/dev/null || continue
-	echo out > $G/gpio$i/direction 2>/dev/null || { echo $i > $G/unexport; continue; }
-	echo 1 > $G/gpio$i/value 2>/dev/null
-	echo "===== GPIO $i ====="
-	sleep 2
-	echo 0 > $G/gpio$i/value 2>/dev/null
-	echo $i > $G/unexport 2>/dev/null
-done
-EOF
-chmod +x "$SRC/files/usr/bin/led-scan"
+# ---------- 6. 硬件自检：开机自动生成 /www/probe.html ----------
+PROBE="$SRC/files/usr/bin/hd51-probe.sh"
+mkdir -p "$SRC/files/usr/bin" "$SRC/files/www/cgi-bin" "$SRC/files/etc/init.d"
 
-cat > "$SRC/files/usr/bin/btn-scan" << 'EOF'
+cat > "$PROBE" << 'PROBE_EOF'
 #!/bin/sh
-# 简化版：先打印全部输入电平，再提示按键，第二次打印，靠肉眼比对
-G=/sys/class/gpio
-L="0 1 2 3 4 5 6 7 8 9 10 11 12 13 17 18 19 20 21 22"
-scan() {
-	for i in $L; do
-		echo $i > $G/export 2>/dev/null
-		echo in > $G/gpio$i/direction 2>/dev/null || continue
-		echo "G$i=$(cat $G/gpio$i/value 2>/dev/null)"
-	done
+# HD51 自检探测：结果写到 /www/probe.html（手机浏览器直接看）
+T=/tmp/probe.raw
+: > "$T"
+sec() { printf '\n===== %s =====\n' "$1" >> "$T"; }
+run() { printf '\n$ %s\n' "$*" >> "$T"; ( "$@" ) >> "$T" 2>&1 || echo "[失败]" >> "$T"; }
+hx() {
+	if command -v hexdump >/dev/null 2>&1; then
+		dd if="$1" bs=1 count="${2:-64}" 2>/dev/null | hexdump -C >> "$T"
+	else
+		dd if="$1" bs=1 count="${2:-64}" 2>/dev/null | od -An -tx1 >> "$T" 2>/dev/null
+	fi
 }
-echo "----- 未按下 -----"
-scan
-echo "----- 现在按住复位键 10 秒 -----"
-sleep 10
-echo "----- 按住中 -----"
-scan
-echo "对比两段，值变了的那行就是复位键"
-EOF
-chmod +x "$SRC/files/usr/bin/btn-scan"
 
-# ---------- 7.5 复位键 = OpenWrt 官方原版（v4 实测可用，不自行改写） ----------
-mkdir -p "$SRC/files/etc/rc.button"
-cat > "$SRC/files/etc/rc.button/reset" << 'RBEOF'
-#!/bin/sh
+sec "0 基本信息"
+run date
+run uname -a
+run cat /etc/openwrt_release
+run cat /proc/cmdline
 
-. /lib/functions.sh
+sec "1 CPU 与内存"
+run sh -c "head -n 60 /proc/cpuinfo"
+run free
+run sh -c "head -n 12 /proc/meminfo"
 
-OVERLAY="$( grep ' /overlay ' /proc/mounts )"
+sec "2 闪存与分区表"
+run cat /proc/mtd
+run sh -c "dmesg | grep -iE 'spi-nor|jedec|mx25|m25p|nand|mtd[0-9]' | head -n 40"
 
-case "$ACTION" in
-pressed)
-	[ -z "$OVERLAY" ] && return 0
+sec "3 引导器取证（Breed / u-boot）"
+printf '\n--- /dev/mtd0 前 64 字节 ---\n' >> "$T"
+hx /dev/mtd0 64
+run sh -c "dd if=/dev/mtd0 bs=1024 count=192 2>/dev/null | tr -c '[:print:]' '\n' | grep -iE 'Breed|breed|r1[0-9][0-9][0-9]|mt7620|layout|offset|u-boot|U-Boot' | head -n 25"
 
-	return 5
-;;
-timeout)
-	. /etc/diag.sh
-	set_state failsafe
-;;
-released)
-	if [ "$SEEN" -lt 1 ]
-	then
-		echo "REBOOT" > /dev/console
-		sync
-		reboot
-	elif [ "$SEEN" -ge 5 -a -n "$OVERLAY" ]
-	then
-		echo "FACTORY RESET" > /dev/console
-		jffs2reset -y && reboot &
-	fi
-;;
-esac
+sec "4 u-boot-env / mtd1"
+hx /dev/mtd1 64
+run sh -c "dd if=/dev/mtd1 bs=1024 count=64 2>/dev/null | tr -c '[:print:]' '\n' | grep -iE 'bootcmd|bootdelay|ipaddr|serverip|ip=|CurrentImage|Image1Try|RestFlag|baud|layout' | head -n 30"
 
-return 0
-RBEOF
-chmod +x "$SRC/files/etc/rc.button/reset"
+sec "5 PCI 总线（5G 芯片关键）"
+run lspci
+run lspci -nn
+run sh -c "for d in /sys/bus/pci/devices/*; do v=\$(cat \$d/vendor 2>/dev/null); p=\$(cat \$d/device 2>/dev/null); drv=\$(basename \$(readlink \$d/driver 2>/dev/null) 2>/dev/null); echo \"\$d vendor=\$v device=\$p driver=\$drv\"; done"
+run sh -c "ls /sys/bus/pci/drivers 2>/dev/null"
 
-# ---------- 8. rc.local = v4 原文 + LED 延迟后台点灯 ----------
-cat > "$SRC/files/etc/rc.local" << 'EOF'
-#!/bin/sh
-sleep 5
-for i in eth0 eth1; do
-	ip link set $i master br-lan 2>/dev/null || true
-done
-swconfig dev switch0 set enable_vlan 1 2>/dev/null
-swconfig dev switch0 vlan 1 set ports "0 1 2 3 4" 2>/dev/null
-{ echo "=== swconfig ==="; swconfig dev switch0 show 2>&1;
-  echo "=== brctl ==="; brctl show 2>&1;
-  echo "=== speed ==="; cat /sys/class/net/eth0/speed /sys/class/net/eth1/speed 2>&1;
-  echo "=== network ==="; cat /etc/config/network 2>&1; } > /tmp/diag-net.txt 2>&1
+sec "6 无线子系统"
+run iw dev
+run sh -c "ls -l /sys/class/ieee80211 2>/dev/null; for p in /sys/class/ieee80211/*; do echo \"== \$p\"; readlink \$p/device 2>/dev/null; done"
+run sh -c "dmesg | grep -iE 'mt76|mt7610|mt7612|rt2x00|phy[0-9]|eeprom|calib|ieee80211' | head -n 40"
+run uci show wireless
 
-# v9：每次启动留痕（写在 overlay，重启不丢；只要 overlay 正常挂上就一定会写）
+sec "7 交换机"
+run sh -c "swconfig dev switch0 show 2>/dev/null | head -n 60"
+
+sec "8 GPIO / 按键 / LED"
+run sh -c "mount -t debugfs none /sys/kernel/debug 2>/dev/null; head -n 60 /sys/kernel/debug/gpio 2>/dev/null || echo 'debugfs gpio 不可读'"
+run sh -c "ls /sys/class/leds 2>/dev/null; for l in /sys/class/leds/*; do echo \"== \$l\"; head -n 1 \$l/trigger 2>/dev/null; done"
+run sh -c "ls /proc/device-tree 2>/dev/null | head -n 40"
+run sh -c "cat /proc/device-tree/keys/reset/label 2>/dev/null; echo"
+
+sec "9 SD / USB"
+run sh -c "dmesg | grep -iE 'mmc|sdhci|usb-storage|scsi|uas' | head -n 40"
+run sh -c "ls -l /dev/sd* /dev/mmcblk* /dev/disk/by-id 2>/dev/null"
+
+sec "10 网络"
+run ip -br link
+run ip -br addr
+
+sec "11 dmesg 尾部"
+run sh -c "dmesg | tail -n 80"
+
+# 生成网页
 {
-	echo "boot=$(date '+%F %T')  uptime=$(cut -d' ' -f1 /proc/uptime)"
-	echo "overlay=$(grep -c ' /overlay ' /proc/mounts)"
-	echo "--------------"
-} >> /etc/le2-boot.log 2>/dev/null
+	printf '%s\n' '<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>HD51 自检</title><style>body{margin:0;padding:10px;background:#0f1216;color:#dfe7ef;font:13px/1.5 monospace}h1{color:#6ad}h2{color:#fc6}p{color:#9ab}pre{white-space:pre-wrap;word-break:break-all;background:#151a20;padding:10px;border-radius:6px}</style></head><body>'
+	printf '%s\n' '<h1>HD51 硬件自检</h1><p>把本页整页截图发回即可；GPIO 点灯：/cgi-bin/gpio?n=13&amp;v=1</p><pre>'
+	sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g' "$T"
+	printf '%s\n' '</pre></body></html>'
+} > /www/probe.html
+cp "$T" /www/probe.txt
+echo "probe 完成 $(date)"
+PROBE_EOF
+chmod +x "$PROBE"
 
-# LED 点灯放到开机 20 秒后的后台子进程里，绝不影响启动
-(
-	sleep 20
-	L=/sys/class/leds
-	if [ -e "$L/green:signal1" ]; then
-		echo netdev > "$L/green:signal1/trigger" 2>/dev/null || true
-		echo eth0 > "$L/green:signal1/device_name" 2>/dev/null || true
-		echo 1 > "$L/green:signal1/link" 2>/dev/null || true
-		echo 0 > "$L/green:signal1/tx" 2>/dev/null || true
-		echo 0 > "$L/green:signal1/rx" 2>/dev/null || true
-	fi
-	if [ -e "$L/green:signal2" ]; then
-		echo netdev > "$L/green:signal2/trigger" 2>/dev/null || true
-		echo eth0 > "$L/green:signal2/device_name" 2>/dev/null || true
-		echo 1 > "$L/green:signal2/tx" 2>/dev/null || true
-		echo 1 > "$L/green:signal2/rx" 2>/dev/null || true
-		echo 0 > "$L/green:signal2/link" 2>/dev/null || true
-	fi
-	if [ -e "$L/green:signal3" ]; then
-		echo none > "$L/green:signal3/trigger" 2>/dev/null || true
-		echo 0 > "$L/green:signal3/brightness" 2>/dev/null || true
-	fi
-) >/dev/null 2>&1 &
-exit 0
-EOF
-chmod +x "$SRC/files/etc/rc.local"
+cat > "$SRC/files/etc/init.d/hd51probe" << 'INIT_EOF'
+#!/bin/sh /etc/rc.common
+START=99
+start() { ( sleep 25; /usr/bin/hd51-probe.sh ) >/dev/null 2>&1 & }
+boot() { start; }
+INIT_EOF
+chmod +x "$SRC/files/etc/init.d/hd51probe"
 
-# ---------- 9. 自检 ----------
-echo "---- 设备定义 ----"; grep -A 16 'define Device/lelink_le2' "$GMK"
-echo "---- DTS LED ----"; grep -n -B1 "GPIO_ACTIVE_HIGH\|gpios = <&gpio 17" "$DTS"
-echo "---- 包 ----"; grep -E 'PACKAGE_iperf3|PACKAGE_hcxdumptool|PACKAGE_reaver|PACKAGE_nodogsplash|PACKAGE_luci-app-commands' "$CFG"
-echo "---- 启动脚本语法 ----"
-for f in "$SRC/files/etc/rc.local" "$SRC/files/etc/rc.button/reset" "$SRC/files/etc/uci-defaults/99-le2-net"; do
-	if sh -n "$f"; then echo "ok $(basename $f)"; else echo "!! 语法错误 $(basename $f)"; fi
+cat > "$SRC/files/www/cgi-bin/gpio" << 'CGI_EOF'
+#!/bin/sh
+printf 'Content-Type: text/plain; charset=utf-8\n\n'
+N=""; V=""
+for kv in $(echo "$QUERY_STRING" | tr '&' ' '); do
+	case "$kv" in
+		n=*) N="${kv#n=}";;
+		v=*) V="${kv#v=}";;
+	esac
 done
-echo "==> 完成"
+[ -n "$N" ] || { echo "用法: /cgi-bin/gpio?n=13&v=1  (v=1 高电平, v=0 低电平, v=i 读输入)"; exit 0; }
+[ -d "/sys/class/gpio/gpio$N" ] || echo "$N" > /sys/class/gpio/export 2>/dev/null
+[ -d "/sys/class/gpio/gpio$N" ] || { echo "GPIO$N 导出失败（多半已被驱动占用）"; exit 1; }
+if [ "${V:-i}" = "i" ]; then
+	echo in > "/sys/class/gpio/gpio$N/direction" 2>/dev/null
+	echo "GPIO$N 输入值 = $(cat /sys/class/gpio/gpio$N/value)"
+else
+	echo out > "/sys/class/gpio/gpio$N/direction" 2>/dev/null
+	echo "$V" > "/sys/class/gpio/gpio$N/value" 2>/dev/null
+	echo "GPIO$N 已设为输出 = $V"
+fi
+CGI_EOF
+chmod +x "$SRC/files/www/cgi-bin/gpio"
+echo "==> 自检脚本已写入（probe.html + cgi 点灯）"
