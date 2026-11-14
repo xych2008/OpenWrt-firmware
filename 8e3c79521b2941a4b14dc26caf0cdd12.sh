@@ -114,13 +114,13 @@ cat > "$SRC/target/linux/ramips/dts/mt7620a_qianmi_hd51.dts" << 'EOF'
 };
 
 &wmac {
-	/* v7：校准数据直接从原厂 factory 分区提取（512 字节），烘进镜像
-	   /lib/firmware/soc_wmac.eeprom。WLAN MAC 8c:88:4b:00:53:8a 与本机实测一致。
-	   这样无线不再依赖 flash 里的 factory 分区——即使 factory 被误擦，
-	   或 Breed 刷错布局覆盖了 mtd2，无线依然能起来。
-	   dtsi 默认属性 ralink,eeprom = "soc_wmac.eeprom" 已被保留，
-	   这里只需把 mtd 通道删掉，驱动就会走固件文件通道。 */
-	/delete-property/ ralink,mtd-eeprom;
+	/* v8：回到实测能工作的方式——从 flash 的 factory 分区读校准。
+	   v5 的 dmesg 实测：rt2800_wmac 10180000.wmac: loaded eeprom from mtd device "factory"
+	   → RT6352/RF7620 识别成功 → phy0-ap0 建立 → 手机拿到 192.168.1.242 / 144Mbps。
+	   v7 把这条删掉改走 /lib/firmware/soc_wmac.eeprom 文件通道，结果无广播，
+	   说明文件通道在这颗芯片上不可靠，回归 mtd。
+	   同时镜像里仍然保留烘入的 /lib/firmware/soc_wmac.eeprom 作为备份。 */
+	ralink,mtd-eeprom = <&factory 0x0>;
 };
 
 &sdhci {
@@ -249,7 +249,7 @@ echo "烘入校准文件 $(wc -c < "$SRC/files/lib/firmware/soc_wmac.eeprom") �
 # 版本标记：浏览器打开 http://192.168.1.1/ver.txt 就能确认烧进去的是哪一版
 mkdir -p "$SRC/files/www"
 cat > "$SRC/files/www/ver.txt" << 'VEREOF'
-HD51 v7
+HD51 v8
 build: 2026-11-15
 dts: /delete-property/ ralink,eeprom + ralink,mtd-eeprom = <&factory 0x0>
 wireless: baked (/etc/config/wireless, radio0, SSID HD51, open)
@@ -258,7 +258,7 @@ VEREOF
 
 cat > "$SRC/files/etc/uci-defaults/99-hd51-basic" << 'EOF'
 #!/bin/sh
-uci -q set system.@system[0].hostname='HD51-v7' || true
+uci -q set system.@system[0].hostname='HD51-v8' || true
 uci -q set system.@system[0].timezone='CST-8' || true
 uci -q set system.@system[0].zonename='Asia/Shanghai' || true
 uci -q commit system
