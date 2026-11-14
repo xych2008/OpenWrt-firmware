@@ -1,6 +1,6 @@
 #!/bin/bash
-# 连乐2 v5 终版：网口指示灯 + 长按复位恢复出厂 + 无线审计脚本(audit-air / audit-hcx)
-# 基于 v4（已实机验证结构：交换机 0-4、LED 14/15/16、复位 17、SUPPORTED_DEVICES、iperf3）
+# 连乐2 v6 稳定版：只装工具 + 两口同 LAN，不接管任何默认启动行为
+# 相对 v5 删掉：rc.button/reset（复位键脚本）、switch0 reset=1、rc.local 里强制 swconfig/wifi
 set -e
 
 WS="${GITHUB_WORKSPACE:-$(cd .. && pwd)}"
@@ -35,11 +35,9 @@ add_cfg CONFIG_PACKAGE_hcxtools
 add_cfg CONFIG_PACKAGE_reaver
 add_cfg CONFIG_PACKAGE_pixiewps
 add_cfg CONFIG_PACKAGE_tmux
-add_cfg CONFIG_PACKAGE_nodogsplash
-add_cfg CONFIG_PACKAGE_luci-app-commands
 add_cfg CONFIG_PACKAGE_iperf3
 sed -i '/CONFIG_PACKAGE_luci-network=y/d; /CONFIG_PACKAGE_luci-system=y/d' "$CFG" 2>/dev/null || true
-echo "==> .config 已补包"
+echo "==> .config 已补包（无 nodogsplash / 无 luci-app-commands）"
 
 # ---------- 3. 设备定义 ----------
 GMK="$SRC/target/linux/ath79/image/generic.mk"
@@ -87,7 +85,7 @@ print(subprocess.run(['grep','-n','gpios',p],capture_output=True,text=True).stdo
 PY
 echo "==> DTS 已改"
 
-# ---------- 5. 网络（两口都 LAN，中继形态） ----------
+# ---------- 5. 网络：两口同属 VLAN1 / br-lan（只跑一次） ----------
 mkdir -p "$SRC/files/etc/uci-defaults"
 cat > "$SRC/files/etc/uci-defaults/99-le2-net" << 'EOF'
 #!/bin/sh
@@ -106,7 +104,6 @@ u add_list network.@device[-1].ports='eth0'
 u add_list network.@device[-1].ports='eth1'
 u add network switch
 u set network.@switch[-1].name='switch0'
-u set network.@switch[-1].reset='1'
 u set network.@switch[-1].enable_vlan='1'
 u add network switch_vlan
 u set network.@switch_vlan[-1].device='switch0'
@@ -143,90 +140,26 @@ uci -q set system.@system[0].timezone='CST-8' || true
 uci -q set system.@system[0].zonename='Asia/Shanghai' || true
 uci -q set system.@system[0].ntp='1' || true
 uci -q commit system
-[ -x /etc/init.d/nodogsplash ] && /etc/init.d/nodogsplash disable 2>/dev/null
 exit 0
 EOF
 chmod +x "$SRC/files/etc/uci-defaults/99-le2-wifi" "$SRC/files/etc/uci-defaults/99-le2-tz"
 
-# ---------- 7. 复位键：短按重启 / 长按 5 秒恢复出厂 ----------
-mkdir -p "$SRC/files/etc/rc.button"
-cat > "$SRC/files/etc/rc.button/reset" << 'EOF'
-#!/bin/sh
-# 短按 -> 重启；按住 >=5 秒 -> 恢复出厂(firstboot)
-FLAG=/tmp/le2-reset-hold
-case "$ACTION" in
-press|pressed)
-	rm -f "$FLAG"
-	echo pressed > "$FLAG"
-	( sleep 5; [ -f "$FLAG" ] && echo hold > "$FLAG" ) &
-	;;
-timeout)
-	echo hold > "$FLAG"
-	logger -t le2-reset "长按 5 秒：恢复出厂"
-	firstboot -y
-	reboot
-	;;
-release|released)
-	if [ "$(cat "$FLAG" 2>/dev/null)" = "hold" ]; then
-		rm -f "$FLAG"
-		logger -t le2-reset "长按：恢复出厂"
-		firstboot -y
-		reboot
-	else
-		rm -f "$FLAG"
-		logger -t le2-reset "短按：重启"
-		reboot
-	fi
-	;;
-esac
-EOF
-chmod +x "$SRC/files/etc/rc.button/reset"
-
-# ---------- 8. rc.local：网口指示灯 + 交换机兜底 + 诊断 ----------
+# ---------- 7. rc.local：只落诊断，不碰网络/不碰 wifi ----------
 cat > "$SRC/files/etc/rc.local" << 'EOF'
 #!/bin/sh
-for i in $(seq 1 20); do [ -d /sys/class/net/br-lan ] && break; sleep 1; done
-
-swconfig dev switch0 set enable_vlan 1 2>/dev/null
-swconfig dev switch0 vlan 1 set ports "0 1 2 3 4" 2>/dev/null
-
-L=/sys/class/leds
-if [ -d "$L/green:signal1" ]; then
-	echo netdev > "$L/green:signal1/trigger" 2>/dev/null
-	echo eth0 > "$L/green:signal1/device_name" 2>/dev/null
-	echo 1 > "$L/green:signal1/link" 2>/dev/null
-	echo 0 > "$L/green:signal1/tx" 2>/dev/null
-	echo 0 > "$L/green:signal1/rx" 2>/dev/null
-fi
-if [ -d "$L/green:signal2" ]; then
-	echo netdev > "$L/green:signal2/trigger" 2>/dev/null
-	echo eth0 > "$L/green:signal2/device_name" 2>/dev/null
-	echo 1 > "$L/green:signal2/tx" 2>/dev/null
-	echo 1 > "$L/green:signal2/rx" 2>/dev/null
-	echo 0 > "$L/green:signal2/link" 2>/dev/null
-fi
-if [ -d "$L/green:signal3" ]; then
-	echo none > "$L/green:signal3/trigger" 2>/dev/null
-	echo 0 > "$L/green:signal3/brightness" 2>/dev/null
-fi
-
 { echo "=== swconfig ==="; swconfig dev switch0 show 2>&1;
   echo "=== brctl ==="; brctl show 2>&1;
-  echo "=== speed ==="; cat /sys/class/net/eth0/speed /sys/class/net/eth1/speed 2>&1;
-  echo "=== leds ==="; ls /sys/class/leds 2>&1;
+  echo "=== links ==="; for i in eth0 eth1; do echo "$i: $(cat /sys/class/net/$i/operstate 2>/dev/null) $(cat /sys/class/net/$i/speed 2>/dev/null)"; done;
+  echo "=== leds ==="; for l in /sys/class/leds/*; do echo "$l -> $(cat $l/trigger 2>/dev/null)"; done;
+  echo "=== wireless ==="; iw dev 2>&1;
   echo "=== network ==="; cat /etc/config/network 2>&1; } > /www/diag-net.txt 2>&1
 exit 0
 EOF
 chmod +x "$SRC/files/etc/rc.local"
 
-
-# ---------- 9. 自检（只验构建产物，不含任何审计脚本） ----------
+# ---------- 8. 自检 ----------
 echo "---- 设备定义 ----"; grep -A 16 'define Device/lelink_le2' "$GMK"
 echo "---- DTS LED ----"; grep -n "gpios = <&gpio" "$DTS"
-echo "---- 复位键 / rc.local ----"; ls -l "$SRC/files/etc/rc.button/" "$SRC/files/etc/" 2>/dev/null
-for f in "$SRC/files/etc/rc.button/reset" "$SRC/files/etc/rc.local"; do
-	if sh -n "$f"; then echo "ok $(basename $f)"; else echo "!! 语法错误 $(basename $f)"; fi
-done
-echo "---- 固件内不应有审计脚本 ----"
-ls "$SRC/files/usr/bin/" 2>/dev/null || echo "（usr/bin 为空，正确）"
+echo "---- rc.local ----"; sh -n "$SRC/files/etc/rc.local" && echo "ok rc.local"
+echo "---- 确认无 rc.button/reset ----"; [ -e "$SRC/files/etc/rc.button/reset" ] && echo "!! 仍存在" || echo "（不存在，正确）"
 echo "==> 完成"
