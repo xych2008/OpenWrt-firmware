@@ -114,13 +114,11 @@ cat > "$SRC/target/linux/ramips/dts/mt7620a_qianmi_hd51.dts" << 'EOF'
 };
 
 &wmac {
-	/* v5 关键修复：校准数据从 flash 的 factory 分区读，而不是去找固件文件。
-	   dtsi 默认给的是 ralink,eeprom = "soc_wmac.eeprom" 字符串，rt2x00lib 会去
-	   request_firmware 找 /lib/firmware/soc_wmac.eeprom —— 这个文件根本不存在，
-	   于是报 "Failed to request EEPROM" / "Error - Failed to read EEPROM file"，
-	   probe 失败 → 没有 wireless phy → 没有任何广播。
-	   rt2x00lib.ko 里实测存在字符串 "ralink,mtd-eeprom" 与
-	   "loaded eeprom from mtd device %s"，说明这条通道是支持的。 */
+	/* v6：把 dtsi 里那条 ralink,eeprom = "soc_wmac.eeprom" 字符串属性直接删掉。
+	   实测 dmesg 证明驱动优先用了它 → 去 request_firmware 找不存在的文件
+	   → "Failed to request EEPROM" → phy0 创建后注册失败 → 无广播。
+	   v5 只加了 mtd-eeprom，日志没变，说明它没被优先使用，必须删干净。 */
+	/delete-property/ ralink,eeprom;
 	ralink,mtd-eeprom = <&factory 0x0>;
 };
 
@@ -234,9 +232,19 @@ config wifi-iface 'default_radio0'
 	option disabled '0'
 WIFIEOF
 
+# 版本标记：浏览器打开 http://192.168.1.1/ver.txt 就能确认烧进去的是哪一版
+mkdir -p "$SRC/files/www"
+cat > "$SRC/files/www/ver.txt" << 'VEREOF'
+HD51 v6
+build: 2026-11-15
+dts: /delete-property/ ralink,eeprom + ralink,mtd-eeprom = <&factory 0x0>
+wireless: baked (/etc/config/wireless, radio0, SSID HD51, open)
+sd: &sdhci status=okay
+VEREOF
+
 cat > "$SRC/files/etc/uci-defaults/99-hd51-basic" << 'EOF'
 #!/bin/sh
-uci -q set system.@system[0].hostname='HD51' || true
+uci -q set system.@system[0].hostname='HD51-v6' || true
 uci -q set system.@system[0].timezone='CST-8' || true
 uci -q set system.@system[0].zonename='Asia/Shanghai' || true
 uci -q commit system
