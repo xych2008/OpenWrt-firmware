@@ -1,6 +1,6 @@
 #!/bin/bash
-# 连乐2 v6 稳定版：只装工具 + 两口同 LAN，不接管任何默认启动行为
-# 相对 v5 删掉：rc.button/reset（复位键脚本）、switch0 reset=1、rc.local 里强制 swconfig/wifi
+# 连乐2 v6：保留 v5 全部功能（工具、nodogsplash、luci-app-commands、复位键、三格灯）
+# 只去掉两个启动期风险点：switch0 reset=1、rc.local 里强设 swconfig
 set -e
 
 WS="${GITHUB_WORKSPACE:-$(cd .. && pwd)}"
@@ -35,9 +35,11 @@ add_cfg CONFIG_PACKAGE_hcxtools
 add_cfg CONFIG_PACKAGE_reaver
 add_cfg CONFIG_PACKAGE_pixiewps
 add_cfg CONFIG_PACKAGE_tmux
+add_cfg CONFIG_PACKAGE_nodogsplash
+add_cfg CONFIG_PACKAGE_luci-app-commands
 add_cfg CONFIG_PACKAGE_iperf3
 sed -i '/CONFIG_PACKAGE_luci-network=y/d; /CONFIG_PACKAGE_luci-system=y/d' "$CFG" 2>/dev/null || true
-echo "==> .config 已补包（无 nodogsplash / 无 luci-app-commands）"
+echo "==> .config 已补包（含 nodogsplash / luci-app-commands）"
 
 # ---------- 3. 设备定义 ----------
 GMK="$SRC/target/linux/ath79/image/generic.mk"
@@ -85,7 +87,7 @@ print(subprocess.run(['grep','-n','gpios',p],capture_output=True,text=True).stdo
 PY
 echo "==> DTS 已改"
 
-# ---------- 5. 网络：两口同属 VLAN1 / br-lan（只跑一次） ----------
+# ---------- 5. 网络：两口同属 VLAN1 / br-lan（只写一次，不含 reset） ----------
 mkdir -p "$SRC/files/etc/uci-defaults"
 cat > "$SRC/files/etc/uci-defaults/99-le2-net" << 'EOF'
 #!/bin/sh
@@ -144,22 +146,82 @@ exit 0
 EOF
 chmod +x "$SRC/files/etc/uci-defaults/99-le2-wifi" "$SRC/files/etc/uci-defaults/99-le2-tz"
 
-# ---------- 7. rc.local：只落诊断，不碰网络/不碰 wifi ----------
+# ---------- 7. 复位键：带三重保护的版本 ----------
+# 保护1：开机 120 秒内不响应（避免启动阶段误判成"长按"）
+# 保护2：只有内核报 timeout（真按住）才 firstboot；release 分支绝不清配置
+# 保护3：每次动作都写 logger，事后可查
+mkdir -p "$SRC/files/etc/rc.button"
+cat > "$SRC/files/etc/rc.button/reset" << 'EOF'
+#!/bin/sh
+FLAG=/tmp/le2-reset-flag
+UP=$(cut -d. -f1 /proc/uptime)
+case "$ACTION" in
+press|pressed)
+	[ "$UP" -lt 120 ] && exit 0
+	echo "$UP" > "$FLAG"
+	logger -t le2-btn "press @${UP}s"
+	;;
+timeout)
+	[ -f "$FLAG" ] || exit 0
+	logger -t le2-btn "长按：恢复出厂"
+	rm -f "$FLAG"
+	firstboot -y
+	reboot
+	;;
+release|released)
+	[ -f "$FLAG" ] || exit 0
+	T=$(cat "$FLAG" 2>/dev/null)
+	rm -f "$FLAG"
+	[ -z "$T" ] && exit 0
+	[ "$UP" -le "$((T + 4))" ] && { logger -t le2-btn "短按：重启"; reboot; }
+	;;
+esac
+exit 0
+EOF
+chmod +x "$SRC/files/etc/rc.button/reset"
+
+# ---------- 8. rc.local：只点灯 + 落诊断，不改交换芯片 ----------
 cat > "$SRC/files/etc/rc.local" << 'EOF'
 #!/bin/sh
+L=/sys/class/leds
+if [ -d "$L/green:signal1" ]; then
+	echo netdev > "$L/green:signal1/trigger" 2>/dev/null
+	echo eth0 > "$L/green:signal1/device_name" 2>/dev/null
+	echo 1 > "$L/green:signal1/link" 2>/dev/null
+	echo 0 > "$L/green:signal1/tx" 2>/dev/null
+	echo 0 > "$L/green:signal1/rx" 2>/dev/null
+fi
+if [ -d "$L/green:signal2" ]; then
+	echo netdev > "$L/green:signal2/trigger" 2>/dev/null
+	echo eth0 > "$L/green:signal2/device_name" 2>/dev/null
+	echo 1 > "$L/green:signal2/tx" 2>/dev/null
+	echo 1 > "$L/green:signal2/rx" 2>/dev/null
+	echo 0 > "$L/green:signal2/link" 2>/dev/null
+fi
+if [ -d "$L/green:signal3" ]; then
+	echo none > "$L/green:signal3/trigger" 2>/dev/null
+	echo 0 > "$L/green:signal3/brightness" 2>/dev/null
+fi
+
 { echo "=== swconfig ==="; swconfig dev switch0 show 2>&1;
   echo "=== brctl ==="; brctl show 2>&1;
   echo "=== links ==="; for i in eth0 eth1; do echo "$i: $(cat /sys/class/net/$i/operstate 2>/dev/null) $(cat /sys/class/net/$i/speed 2>/dev/null)"; done;
-  echo "=== leds ==="; for l in /sys/class/leds/*; do echo "$l -> $(cat $l/trigger 2>/dev/null)"; done;
   echo "=== wireless ==="; iw dev 2>&1;
+  echo "=== logread net ==="; logread 2>/dev/null | grep -iE "netifd|hostapd|wpa|switch" | tail -30;
   echo "=== network ==="; cat /etc/config/network 2>&1; } > /www/diag-net.txt 2>&1
 exit 0
 EOF
 chmod +x "$SRC/files/etc/rc.local"
 
-# ---------- 8. 自检 ----------
+# ---------- 9. 自检 ----------
 echo "---- 设备定义 ----"; grep -A 16 'define Device/lelink_le2' "$GMK"
 echo "---- DTS LED ----"; grep -n "gpios = <&gpio" "$DTS"
-echo "---- rc.local ----"; sh -n "$SRC/files/etc/rc.local" && echo "ok rc.local"
-echo "---- 确认无 rc.button/reset ----"; [ -e "$SRC/files/etc/rc.button/reset" ] && echo "!! 仍存在" || echo "（不存在，正确）"
+echo "---- 启动脚本语法 ----"
+for f in "$SRC/files/etc/rc.button/reset" "$SRC/files/etc/rc.local" \
+         "$SRC/files/etc/uci-defaults/99-le2-net" "$SRC/files/etc/uci-defaults/99-le2-wifi" \
+         "$SRC/files/etc/uci-defaults/99-le2-tz"; do
+	if sh -n "$f"; then echo "ok $(basename $f)"; else echo "!! 语法错误 $(basename $f)"; fi
+done
+echo "---- 确认已无 switch reset ----"
+grep -q "reset='1'" "$SRC/files/etc/uci-defaults/99-le2-net" && echo "!! 仍存在" || echo "（已移除）"
 echo "==> 完成"
