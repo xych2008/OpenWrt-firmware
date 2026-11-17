@@ -161,7 +161,7 @@ cat >> "$GMK" << 'EOF'
 
 define Device/qianmi_hd51
   SOC := mt7620a
-  IMAGE_SIZE := 16320k
+  IMAGE_SIZE := 16064k
   DEVICE_VENDOR := Qianmi
   DEVICE_MODEL := HD51
   DEVICE_DTS := mt7620a_qianmi_hd51
@@ -266,8 +266,8 @@ echo "烘入校准文件 $(wc -c < "$SRC/files/lib/firmware/soc_wmac.eeprom") �
 # 版本标记：浏览器打开 http://192.168.1.1/ver.txt 就能确认烧进去的是哪一版
 mkdir -p "$SRC/files/www"
 cat > "$SRC/files/www/ver.txt" << 'VEREOF'
-HD51 v9
-build: 2026-11-15
+HD51 v10
+build: 2026-11-17
 dts: /delete-property/ ralink,eeprom + ralink,mtd-eeprom = <&factory 0x0>
 wireless: baked (/etc/config/wireless, radio0, SSID HD51, open)
 sd: &sdhci status=okay
@@ -275,7 +275,7 @@ VEREOF
 
 cat > "$SRC/files/etc/uci-defaults/99-hd51-basic" << 'EOF'
 #!/bin/sh
-uci -q set system.@system[0].hostname='HD51-v9' || true
+uci -q set system.@system[0].hostname='HD51-v10' || true
 uci -q set system.@system[0].timezone='CST-8' || true
 uci -q set system.@system[0].zonename='Asia/Shanghai' || true
 uci -q commit system
@@ -307,6 +307,97 @@ printf 'hd51\nhd51\n' | passwd root >/dev/null 2>&1 || true
 exit 0
 EOF
 chmod +x "$SRC/files/etc/uci-defaults/99-hd51-basic"
+
+
+# ---------- 4b. v10 内核补丁：强制 MT7620A SoC 封装号，救回外置 PA/LNA ----------
+# 依据：ImmortalWrt 23.05 的 rt2x00 补丁 998（rework MT7620 PA/LNA RF calibration）
+# 里，所有外置 PA/LNA 的 RF/BBP 写入都被 rt2800_hw_get_chippkg()==1 门控；
+# 而 rt2800soc_get_chippkg() 直接返回 mt7620_get_pkg()。若该值为 0，
+# 整段 PA/LNA 寄存器（RF 14/17/18、43..61，BBP 75/76/79/80/82）一个都不写，
+# 射频只剩内部 PA —— 实测表现就是“能连、3 米必断、AP 侧收站点 -78dBm”。
+PATCHDIR="$SRC/package/kernel/mac80211/patches/rt2x00"
+mkdir -p "$PATCHDIR"
+cat > "$PATCHDIR/999-hd51-force-soc-pkg.patch" << 'PEOF'
+--- a/drivers/net/wireless/ralink/rt2x00/rt2800soc.c
++++ b/drivers/net/wireless/ralink/rt2x00/rt2800soc.c
+@@ -120,5 +120,19 @@
+ #ifdef CONFIG_SOC_MT7620
+ static int rt2800soc_get_chippkg(void)
+ {
+-	return mt7620_get_pkg();
++	/* HD51：强制按 MT7620A SoC 封装(pkg=1)处理。
++	 * rt2800lib 中所有外置 PA/LNA 寄存器写入均以
++	 * "rt2800_hw_get_chippkg()==1" 为条件，返回 0 时整段被跳过，
++	 * 表现就是"能连、3 米必断、AP 侧收到站点 -78dBm"。
++	 */
++	static int hd51_logged;
++	int pkg = mt7620_get_pkg();
++
++	if (!hd51_logged) {
++		pr_info("rt2800soc: HD51 MT7620 pkg=%d chipver=%d eco=%d forced1\n",
++			pkg, mt7620_get_chipver(), mt7620_get_eco());
++		hd51_logged = 1;
++	}
++
++	return 1;
+ }
+@@ -140,3 +150,3 @@
+ #else
+-static int rt2800soc_get_chippkg(void) { return 0; }
++static int rt2800soc_get_chippkg(void) { return 1; }
+ static int rt2800soc_get_chipver(void) { return 0; }
+PEOF
+echo "==> v10 补丁已写入 $PATCHDIR/999-hd51-force-soc-pkg.patch"
+
+# ---------- 4c. 实时诊断页 /cgi-bin/diag + 启动打点 /www/bootlog.txt ----------
+cat > "$SRC/files/www/cgi-bin/diag" << 'DIAG_EOF'
+#!/bin/sh
+printf 'Content-Type: text/plain; charset=utf-8\n\n'
+echo "===== date ====="
+date
+echo "===== uptime ====="
+cat /proc/uptime
+echo "===== SoC CHIP_VER (0x1000002c) ====="
+devmem 0x1000002c 32 2>/dev/null || echo "devmem 不可用"
+echo "===== iw dev ====="
+iw dev 2>&1
+echo "===== phy0-ap0 计数 (tx/rx packets) ====="
+cat /sys/class/net/phy0-ap0/statistics/tx_packets 2>/dev/null
+cat /sys/class/net/phy0-ap0/statistics/rx_packets 2>/dev/null
+echo "===== station dump（AP 侧收到各站点的信号） ====="
+iw dev phy0-ap0 station dump 2>&1
+echo "===== survey（各信道噪声/占用） ====="
+iw dev phy0-ap0 survey dump 2>&1 | head -n 40
+echo "===== dmesg 无线相关 ====="
+dmesg | grep -iE 'rt2x00|rt2800|phy0|eeprom|calib|PA|LNA' | tail -n 80
+echo "===== 启动时序（bootlog） ====="
+cat /www/bootlog.txt 2>/dev/null
+DIAG_EOF
+chmod +x "$SRC/files/www/cgi-bin/diag"
+
+cat > "$SRC/files/etc/init.d/hd51bootlog" << 'LOG_EOF'
+#!/bin/sh /etc/rc.common
+START=1
+boot() {
+	(
+		: > /www/bootlog.txt
+		i=0
+		while [ $i -lt 100 ]; do
+			up=$(cut -d. -f1 /proc/uptime)
+			phy=no; [ -d /sys/class/ieee80211/phy0 ] && phy=yes
+			hp=no-hostapd; pidof hostapd >/dev/null 2>&1 && hp=hostapd-up
+			ap=no-ap-if; [ -d /sys/class/net/phy0-ap0 ] && ap=ap-if
+			echo "$up s phy0=$phy $hp $ap" >> /www/bootlog.txt
+			[ "$ap" = "ap-if" ] && [ $i -gt 2 ] && break
+			i=$((i+1))
+			sleep 2
+		done
+	) &
+}
+start() { boot; }
+LOG_EOF
+chmod +x "$SRC/files/etc/init.d/hd51bootlog"
+echo "==> v10 诊断页 + 启动打点已写入"
 
 # ---------- 5. .config 里补包 ----------
 CFG="$WS/${CONFIG_FILE:-.config.hd51}"
