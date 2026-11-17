@@ -161,7 +161,7 @@ cat >> "$GMK" << 'EOF'
 
 define Device/qianmi_hd51
   SOC := mt7620a
-  IMAGE_SIZE := 16064k
+  IMAGE_SIZE := 16320k
   DEVICE_VENDOR := Qianmi
   DEVICE_MODEL := HD51
   DEVICE_DTS := mt7620a_qianmi_hd51
@@ -267,7 +267,7 @@ echo "烘入校准文件 $(wc -c < "$SRC/files/lib/firmware/soc_wmac.eeprom") �
 mkdir -p "$SRC/files/www"
 cat > "$SRC/files/www/ver.txt" << 'VEREOF'
 HD51 v10
-build: 2026-11-17
+build: 2026-11-15
 dts: /delete-property/ ralink,eeprom + ralink,mtd-eeprom = <&factory 0x0>
 wireless: baked (/etc/config/wireless, radio0, SSID HD51, open)
 sd: &sdhci status=okay
@@ -308,97 +308,6 @@ exit 0
 EOF
 chmod +x "$SRC/files/etc/uci-defaults/99-hd51-basic"
 
-
-# ---------- 4b. v10 内核补丁：强制 MT7620A SoC 封装号，救回外置 PA/LNA ----------
-# 依据：ImmortalWrt 23.05 的 rt2x00 补丁 998（rework MT7620 PA/LNA RF calibration）
-# 里，所有外置 PA/LNA 的 RF/BBP 写入都被 rt2800_hw_get_chippkg()==1 门控；
-# 而 rt2800soc_get_chippkg() 直接返回 mt7620_get_pkg()。若该值为 0，
-# 整段 PA/LNA 寄存器（RF 14/17/18、43..61，BBP 75/76/79/80/82）一个都不写，
-# 射频只剩内部 PA —— 实测表现就是“能连、3 米必断、AP 侧收站点 -78dBm”。
-PATCHDIR="$SRC/package/kernel/mac80211/patches/rt2x00"
-mkdir -p "$PATCHDIR"
-cat > "$PATCHDIR/999-hd51-force-soc-pkg.patch" << 'PEOF'
---- a/drivers/net/wireless/ralink/rt2x00/rt2800soc.c
-+++ b/drivers/net/wireless/ralink/rt2x00/rt2800soc.c
-@@ -120,5 +120,19 @@
- #ifdef CONFIG_SOC_MT7620
- static int rt2800soc_get_chippkg(void)
- {
--	return mt7620_get_pkg();
-+	/* HD51：强制按 MT7620A SoC 封装(pkg=1)处理。
-+	 * rt2800lib 中所有外置 PA/LNA 寄存器写入均以
-+	 * "rt2800_hw_get_chippkg()==1" 为条件，返回 0 时整段被跳过，
-+	 * 表现就是"能连、3 米必断、AP 侧收到站点 -78dBm"。
-+	 */
-+	static int hd51_logged;
-+	int pkg = mt7620_get_pkg();
-+
-+	if (!hd51_logged) {
-+		pr_info("rt2800soc: HD51 MT7620 pkg=%d chipver=%d eco=%d forced1\n",
-+			pkg, mt7620_get_chipver(), mt7620_get_eco());
-+		hd51_logged = 1;
-+	}
-+
-+	return 1;
- }
-@@ -140,3 +150,3 @@
- #else
--static int rt2800soc_get_chippkg(void) { return 0; }
-+static int rt2800soc_get_chippkg(void) { return 1; }
- static int rt2800soc_get_chipver(void) { return 0; }
-PEOF
-echo "==> v10 补丁已写入 $PATCHDIR/999-hd51-force-soc-pkg.patch"
-
-# ---------- 4c. 实时诊断页 /cgi-bin/diag + 启动打点 /www/bootlog.txt ----------
-cat > "$SRC/files/www/cgi-bin/diag" << 'DIAG_EOF'
-#!/bin/sh
-printf 'Content-Type: text/plain; charset=utf-8\n\n'
-echo "===== date ====="
-date
-echo "===== uptime ====="
-cat /proc/uptime
-echo "===== SoC CHIP_VER (0x1000002c) ====="
-devmem 0x1000002c 32 2>/dev/null || echo "devmem 不可用"
-echo "===== iw dev ====="
-iw dev 2>&1
-echo "===== phy0-ap0 计数 (tx/rx packets) ====="
-cat /sys/class/net/phy0-ap0/statistics/tx_packets 2>/dev/null
-cat /sys/class/net/phy0-ap0/statistics/rx_packets 2>/dev/null
-echo "===== station dump（AP 侧收到各站点的信号） ====="
-iw dev phy0-ap0 station dump 2>&1
-echo "===== survey（各信道噪声/占用） ====="
-iw dev phy0-ap0 survey dump 2>&1 | head -n 40
-echo "===== dmesg 无线相关 ====="
-dmesg | grep -iE 'rt2x00|rt2800|phy0|eeprom|calib|PA|LNA' | tail -n 80
-echo "===== 启动时序（bootlog） ====="
-cat /www/bootlog.txt 2>/dev/null
-DIAG_EOF
-chmod +x "$SRC/files/www/cgi-bin/diag"
-
-cat > "$SRC/files/etc/init.d/hd51bootlog" << 'LOG_EOF'
-#!/bin/sh /etc/rc.common
-START=1
-boot() {
-	(
-		: > /www/bootlog.txt
-		i=0
-		while [ $i -lt 100 ]; do
-			up=$(cut -d. -f1 /proc/uptime)
-			phy=no; [ -d /sys/class/ieee80211/phy0 ] && phy=yes
-			hp=no-hostapd; pidof hostapd >/dev/null 2>&1 && hp=hostapd-up
-			ap=no-ap-if; [ -d /sys/class/net/phy0-ap0 ] && ap=ap-if
-			echo "$up s phy0=$phy $hp $ap" >> /www/bootlog.txt
-			[ "$ap" = "ap-if" ] && [ $i -gt 2 ] && break
-			i=$((i+1))
-			sleep 2
-		done
-	) &
-}
-start() { boot; }
-LOG_EOF
-chmod +x "$SRC/files/etc/init.d/hd51bootlog"
-echo "==> v10 诊断页 + 启动打点已写入"
-
 # ---------- 5. .config 里补包 ----------
 CFG="$WS/${CONFIG_FILE:-.config.hd51}"
 add_cfg() { grep -q "^$1=y" "$CFG" 2>/dev/null || echo "$1=y" >> "$CFG"; }
@@ -417,6 +326,8 @@ add_cfg CONFIG_PACKAGE_kmod-usb-ohci
 add_cfg CONFIG_PACKAGE_kmod-gpio-button-hotplug
 add_cfg CONFIG_PACKAGE_kmod-usb-storage
 add_cfg CONFIG_PACKAGE_kmod-fs-exfat
+add_cfg CONFIG_DEVMEM
+add_cfg CONFIG_BUSYBOX_CONFIG_DEVMEM
 echo "==> .config 已补包（$CFG）"
 
 # ---------- 6. 硬件自检：开机自动生成 /www/probe.html ----------
@@ -538,3 +449,126 @@ fi
 CGI_EOF
 chmod +x "$SRC/files/www/cgi-bin/gpio"
 echo "==> 自检脚本已写入（probe.html + cgi 点灯）"
+
+# ---------- 7. v10：发射/接收寄存器实时读写口（devmem 直捅 wmac 寄存器区） ----------
+# 目的：不再靠"再刷一版"来试参数。MAC 寄存器区基址 0x10180000（dmesg: platform/10180000.wmac），
+# RF_CONTROL0..3 = +0x518/+0x520/+0x528/+0x530，RF_BYPASS0..3 = +0x51c/+0x524/+0x52c/+0x534
+cat > "$SRC/files/www/cgi-bin/reg" << 'REG_EOF'
+#!/bin/sh
+printf 'Content-Type: text/plain; charset=utf-8\n\n'
+BASE=0x10180000
+for kv in $(echo "$QUERY_STRING" | tr '&' ' '); do
+	case "$kv" in
+		off=*) OFF="${kv#off=}";;
+		val=*) VAL="${kv#val=}";;
+	esac
+done
+[ -n "$OFF" ] || {
+	echo "用法: /cgi-bin/reg?off=0x530            (读)"
+	echo "      /cgi-bin/reg?off=0x530&val=0x101   (写)"
+	echo ""
+	echo "常用: 0x518/0x51c RF_CONTROL0/BYPASS0"
+	echo "      0x520/0x524 RF_CONTROL1/BYPASS1"
+	echo "      0x528/0x52c RF_CONTROL2/BYPASS2"
+	echo "      0x530/0x534 RF_CONTROL3/BYPASS3"
+	echo ""
+	echo "--- 当前值 ---"
+	for o in 518 51c 520 524 528 52c 530 534; do
+		v=$(devmem $((BASE + 0x$o)) 2>/dev/null)
+		echo "0x$o = $v"
+	done
+	exit 0
+}
+ADDR=$((BASE + OFF))
+if [ -n "$VAL" ]; then
+	OUT=$(devmem $ADDR 32 $VAL 2>&1)
+	echo "写 $OFF = $VAL : $OUT"
+fi
+echo "$OFF 现在 = $(devmem $ADDR 32 2>/dev/null)"
+REG_EOF
+chmod +x "$SRC/files/www/cgi-bin/reg"
+
+# ---------- 8. v10：实时诊断页 /cgi-bin/diag（每次刷新都是当前状态） ----------
+cat > "$SRC/files/www/cgi-bin/diag" << 'DIAG_EOF'
+#!/bin/sh
+printf 'Content-Type: text/plain; charset=utf-8\n\n'
+echo "===== 时间 ====="
+echo "uptime(秒) = $(cut -d' ' -f1 /proc/uptime)"
+date
+echo
+echo "===== 无线接口 ====="
+iw dev 2>&1
+echo
+echo "===== 已连接站点（AP 收到的 dBm 在这里） ====="
+iw dev phy0-ap0 station dump 2>&1 | head -n 40
+echo
+echo "===== 发射计数（beacon 有没有真发出去） ====="
+for f in tx_packets tx_bytes tx_errors rx_packets rx_bytes; do
+	printf '%-12s %s\n' "$f" "$(cat /sys/class/net/phy0-ap0/statistics/$f 2>/dev/null)"
+done
+echo
+echo "===== RF 控制寄存器（可能藏着 PA/LNA 路径开关） ====="
+for o in 518 51c 520 524 528 52c 530 534; do
+	v=$(devmem $((0x10180000 + 0x$o)) 32 2>/dev/null)
+	printf '0x%s = %s\n' "$o" "$v"
+done
+echo
+echo "===== 启动时序 ====="
+cat /www/timeline.txt 2>/dev/null
+echo
+echo "===== dmesg 无线相关 ====="
+dmesg | grep -iE 'rt2x00|rt28|phy0|calib|eeprom|br-lan' | tail -n 40
+DIAG_EOF
+chmod +x "$SRC/files/www/cgi-bin/diag"
+
+# ---------- 9. v10：启动时序打点（全部用内核 uptime 秒，最准） ----------
+mkdir -p "$SRC/files/etc/init.d"
+for n in 05 15 25 40 60 80 95; do
+cat > "$SRC/files/etc/init.d/hd51m$n" << MARK_EOF
+#!/bin/sh /etc/rc.common
+START=$n
+start() {
+	echo "[\$(cut -d' ' -f1 /proc/uptime)s] init.d START=$n" >> /www/timeline.txt
+}
+boot() { start; }
+MARK_EOF
+chmod +x "$SRC/files/etc/init.d/hd51m$n"
+done
+
+cat > "$SRC/files/usr/bin/hd51-watch.sh" << 'W_EOF'
+#!/bin/sh
+# 一直盯着 phy0-ap0：出现的那一刻、以及进入 forwarding 的那一刻都打点
+T=/www/timeline.txt
+: > "$T"
+echo "$(cut -d' ' -f1 /proc/uptime) watchdog-start" >> "$T"
+i=0
+while [ $i -lt 600 ]; do
+	if [ -e /sys/class/net/phy0-ap0/statistics ]; then
+		if [ ! -f /tmp/.ap0seen ]; then
+			echo "$(cut -d' ' -f1 /proc/uptime) phy0-ap0 出现" >> "$T"
+			touch /tmp/.ap0seen
+		fi
+	fi
+	if dmesg | grep -q "port 3(phy0-ap0) entered forwarding"; then
+		if [ ! -f /tmp/.fwdseen ]; then
+			echo "$(cut -d' ' -f1 /proc/uptime) br-lan forwarding" >> "$T"
+			touch /tmp/.fwdseen
+			break
+		fi
+	fi
+	sleep 1
+	i=$((i+1))
+done
+echo "$(cut -d' ' -f1 /proc/uptime) watchdog-exit" >> "$T"
+W_EOF
+chmod +x "$SRC/files/usr/bin/hd51-watch.sh"
+
+cat > "$SRC/files/etc/init.d/hd51watch" << 'WI_EOF'
+#!/bin/sh /etc/rc.common
+START=01
+start() { ( /usr/bin/hd51-watch.sh ) >/dev/null 2>&1 & }
+boot() { start; }
+WI_EOF
+chmod +x "$SRC/files/etc/init.d/hd51watch"
+echo "==> v10 诊断/打点/kernel 调试口 已写入"
+
