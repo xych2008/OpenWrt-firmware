@@ -266,7 +266,7 @@ echo "烘入校准文件 $(wc -c < "$SRC/files/lib/firmware/soc_wmac.eeprom") �
 # 版本标记：浏览器打开 http://192.168.1.1/ver.txt 就能确认烧进去的是哪一版
 mkdir -p "$SRC/files/www"
 cat > "$SRC/files/www/ver.txt" << 'VEREOF'
-HD51 v10
+HD51 v11
 build: 2026-11-15
 dts: /delete-property/ ralink,eeprom + ralink,mtd-eeprom = <&factory 0x0>
 wireless: baked (/etc/config/wireless, radio0, SSID HD51, open)
@@ -275,7 +275,7 @@ VEREOF
 
 cat > "$SRC/files/etc/uci-defaults/99-hd51-basic" << 'EOF'
 #!/bin/sh
-uci -q set system.@system[0].hostname='HD51-v10' || true
+uci -q set system.@system[0].hostname='HD51-v11' || true
 uci -q set system.@system[0].timezone='CST-8' || true
 uci -q set system.@system[0].zonename='Asia/Shanghai' || true
 uci -q commit system
@@ -399,8 +399,8 @@ run sh -c "dmesg | grep -iE 'mmc|sdhci|usb-storage|scsi|uas' | head -n 40"
 run sh -c "ls -l /dev/sd* /dev/mmcblk* /dev/disk/by-id 2>/dev/null"
 
 sec "10 网络"
-run ip -br link
-run ip -br addr
+run sh -c "ifconfig -a"
+run sh -c "ip addr show"
 
 sec "11 dmesg 尾部"
 run sh -c "dmesg | tail -n 80"
@@ -571,4 +571,165 @@ boot() { start; }
 WI_EOF
 chmod +x "$SRC/files/etc/init.d/hd51watch"
 echo "==> v10 诊断/打点/kernel 调试口 已写入"
+
+# ---------- 10. v11：内核小模块 /proc/hd51reg（不依赖 busybox devmem） ----------
+PKGD="$SRC/package/hd51reg"
+mkdir -p "$PKGD/src"
+cat > "$PKGD/Makefile" << 'PKG_EOF'
+include $(TOPDIR)/rules.mk
+include $(INCLUDE_DIR)/kernel.mk
+
+PKG_NAME:=hd51reg
+PKG_VERSION:=1.0
+PKG_RELEASE:=1
+PKG_LICENSE:=GPL-2.0
+
+include $(INCLUDE_DIR)/package.mk
+
+define KernelPackage/hd51reg
+  SUBMENU:=Other modules
+  TITLE:=HD51 wmac register poking
+  FILES:=$(PKG_BUILD_DIR)/hd51reg.ko
+  AUTOLOAD:=$(call AutoLoad,90,hd51reg)
+endef
+
+define KernelPackage/hd51reg/description
+ HD51 debug: read/write MT7620 wmac MAC registers via /proc/hd51reg
+endef
+
+define Build/Prepare
+	mkdir -p $(PKG_BUILD_DIR)
+	$(CP) ./src/* $(PKG_BUILD_DIR)/
+endef
+
+define Build/Compile
+	$(MAKE) -C "$(LINUX_DIR)" $(KERNEL_MAKE_FLAGS) M="$(PKG_BUILD_DIR)" modules
+endef
+
+$(eval $(call KernelPackage,hd51reg))
+PKG_EOF
+
+printf 'obj-m += hd51reg.o\n' > "$PKGD/src/Makefile"
+
+cat > "$PKGD/src/hd51reg.c" << 'C_EOF'
+// SPDX-License-Identifier: GPL-2.0
+#include <linux/module.h>
+#include <linux/proc_fs.h>
+#include <linux/io.h>
+#include <linux/uaccess.h>
+#include <linux/seq_file.h>
+#include <linux/kernel.h>
+#include <linux/string.h>
+#include <linux/types.h>
+
+#define WMAC_PHYS 0x10180000
+#define WMAC_SIZE 0x0800
+
+static void __iomem *base;
+static char last[64] = "no-write-yet\n";
+
+static int hd51_show(struct seq_file *m, void *v)
+{
+	u32 off;
+	seq_printf(m, "last: %s", last);
+	seq_puts(m, "REG  ADDR        VALUE\n");
+	for (off = 0x500; off <= 0x540; off += 4)
+		seq_printf(m, "0x%03x 0x%08x 0x%08x\n", off,
+			   WMAC_PHYS + off, readl(base + off));
+	seq_puts(m, "\n用法: echo \"w 0x530 0x101\" > /proc/hd51reg\n");
+	return 0;
+}
+static int hd51_open(struct inode *i, struct file *f)
+{
+	return single_open(f, hd51_show, NULL);
+}
+static ssize_t hd51_write(struct file *f, const char __user *buf,
+			  size_t len, loff_t *off)
+{
+	char tmp[64];
+	char *p, *tok;
+	unsigned long addr = 0, val = 0;
+	int rc;
+
+	if (len >= sizeof(tmp))
+		return -EINVAL;
+	if (copy_from_user(tmp, buf, len))
+		return -EFAULT;
+	tmp[len] = 0;
+
+	p = tmp;
+	tok = strsep(&p, " \t\n");
+	if (!tok || tok[0] != 'w' || tok[1] != 0)
+		return -EINVAL;
+	tok = strsep(&p, " \t\n");
+	if (!tok)
+		return -EINVAL;
+	rc = kstrtoul(tok, 0, &addr);
+	if (rc)
+		return -EINVAL;
+	tok = strsep(&p, " \t\n");
+	if (!tok)
+		return -EINVAL;
+	rc = kstrtoul(tok, 0, &val);
+	if (rc)
+		return -EINVAL;
+	if (addr > WMAC_SIZE - 4)
+		return -EINVAL;
+
+	writel((u32)val, base + addr);
+	scnprintf(last, sizeof(last), "wrote 0x%lx=0x%lx, readback 0x%08x\n",
+		  addr, val, readl(base + addr));
+	return len;
+}
+static const struct proc_ops hd51_pops = {
+	.proc_open	= hd51_open,
+	.proc_read	= seq_read,
+	.proc_lseek	= seq_lseek,
+	.proc_release	= single_release,
+	.proc_write	= hd51_write,
+};
+static int __init hd51reg_init(void)
+{
+	base = ioremap(WMAC_PHYS, WMAC_SIZE);
+	if (!base)
+		return -ENOMEM;
+	if (!proc_create("hd51reg", 0644, NULL, &hd51_pops)) {
+		iounmap(base);
+		return -ENOMEM;
+	}
+	pr_info("hd51reg: wmac mapped, /proc/hd51reg ready\n");
+	return 0;
+}
+static void __exit hd51reg_exit(void)
+{
+	remove_proc_entry("hd51reg", NULL);
+	iounmap(base);
+}
+module_init(hd51reg_init);
+module_exit(hd51reg_exit);
+MODULE_LICENSE("GPL");
+MODULE_DESCRIPTION("HD51 wmac register poking");
+C_EOF
+
+add_cfg CONFIG_PACKAGE_kmod-hd51reg
+
+cat > "$SRC/files/www/cgi-bin/reg" << 'REG_EOF'
+#!/bin/sh
+printf 'Content-Type: text/plain; charset=utf-8\n\n'
+OFF=""; VAL=""
+for kv in $(echo "$QUERY_STRING" | tr '&' ' '); do
+	case "$kv" in
+		off=*) OFF="${kv#off=}";;
+		val=*) VAL="${kv#val=}";;
+	esac
+done
+[ -e /proc/hd51reg ] || { echo "/proc/hd51reg 不存在"; lsmod | grep hd51reg; exit 1; }
+if [ -n "$OFF" ] && [ -n "$VAL" ]; then
+	echo "w $OFF $VAL" > /proc/hd51reg && echo "已写: $OFF = $VAL"
+fi
+cat /proc/hd51reg
+REG_EOF
+chmod +x "$SRC/files/www/cgi-bin/reg"
+echo "==> v11 内核模块 + reg 页 已写入"
+
 
