@@ -266,7 +266,7 @@ echo "烘入校准文件 $(wc -c < "$SRC/files/lib/firmware/soc_wmac.eeprom") �
 # 版本标记：浏览器打开 http://192.168.1.1/ver.txt 就能确认烧进去的是哪一版
 mkdir -p "$SRC/files/www"
 cat > "$SRC/files/www/ver.txt" << 'VEREOF'
-HD51 v12
+HD51 v13
 build: 2026-11-15
 dts: /delete-property/ ralink,eeprom + ralink,mtd-eeprom = <&factory 0x0>
 wireless: baked (/etc/config/wireless, radio0, SSID HD51, open)
@@ -275,7 +275,7 @@ VEREOF
 
 cat > "$SRC/files/etc/uci-defaults/99-hd51-basic" << 'EOF'
 #!/bin/sh
-uci -q set system.@system[0].hostname='HD51-v12' || true
+uci -q set system.@system[0].hostname='HD51-v13' || true
 uci -q set system.@system[0].timezone='CST-8' || true
 uci -q set system.@system[0].zonename='Asia/Shanghai' || true
 uci -q commit system
@@ -455,36 +455,73 @@ echo "==> 自检脚本已写入（probe.html + cgi 点灯）"
 # RF_CONTROL0..3 = +0x518/+0x520/+0x528/+0x530，RF_BYPASS0..3 = +0x51c/+0x524/+0x52c/+0x534
 cat > "$SRC/files/www/cgi-bin/reg" << 'REG_EOF'
 #!/bin/sh
-printf 'Content-Type: text/plain; charset=utf-8\n\n'
-BASE=0x10180000
+printf 'Content-Type: text/html; charset=utf-8\n\n'
+html_head() {
+cat << 'H'
+<!DOCTYPE html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>HD51 射频调试台</title>
+<style>
+body{font-family:sans-serif;margin:0;padding:12px;background:#f7f7f7;color:#111}
+h2{margin:6px 0 12px}
+a.b{display:inline-block;margin:3px;padding:9px 13px;background:#1a73e8;color:#fff;
+border-radius:6px;text-decoration:none;font-size:15px}
+a.g{background:#0b8f3f}a.r{background:#c0392b}a.k{background:#555}
+.wrap{display:flex;flex-wrap:wrap;margin:8px 0 14px}
+pre{background:#fff;border:1px solid #ddd;padding:10px;overflow:auto;font-size:13px;line-height:1.45}
+h3{margin:16px 0 4px;font-size:16px}
+</style></head><body>
+H
+}
+html_head
+echo "<h2>HD51 射频调试台 <small>$(cat /www/ver.txt 2>/dev/null | head -1)</small></h2>"
+
+# 动作
 for kv in $(echo "$QUERY_STRING" | tr '&' ' '); do
 	case "$kv" in
-		off=*) OFF="${kv#off=}";;
-		val=*) VAL="${kv#val=}";;
+		d=*) D="${kv#d=}";;
+		v=*) V="${kv#v=}";;
+		r=*) R="${kv#r=}";;
 	esac
 done
-[ -n "$OFF" ] || {
-	echo "用法: /cgi-bin/reg?off=0x530            (读)"
-	echo "      /cgi-bin/reg?off=0x530&val=0x101   (写)"
-	echo ""
-	echo "常用: 0x518/0x51c RF_CONTROL0/BYPASS0"
-	echo "      0x520/0x524 RF_CONTROL1/BYPASS1"
-	echo "      0x528/0x52c RF_CONTROL2/BYPASS2"
-	echo "      0x530/0x534 RF_CONTROL3/BYPASS3"
-	echo ""
-	echo "--- 当前值 ---"
-	for o in 518 51c 520 524 528 52c 530 534; do
-		v=$(devmem $((BASE + 0x$o)) 2>/dev/null)
-		echo "0x$o = $v"
-	done
-	exit 0
-}
-ADDR=$((BASE + OFF))
-if [ -n "$VAL" ]; then
-	OUT=$(devmem $ADDR 32 $VAL 2>&1)
-	echo "写 $OFF = $VAL : $OUT"
+if echo "$QUERY_STRING" | grep -q "act=tx&"; then
+	echo "tx $D" > /proc/hd51reg 2>/dev/null
+	echo "<p style='color:#0b8f3f;font-weight:bold'>已执行：TX 功率字段 + $D</p>"
 fi
-echo "$OFF 现在 = $(devmem $ADDR 32 2>/dev/null)"
+if echo "$QUERY_STRING" | grep -q "act=txset"; then
+	echo "txset $V" > /proc/hd51reg 2>/dev/null
+	echo "<p style='color:#0b8f3f;font-weight:bold'>已执行：TX 功率字段 = $V</p>"
+fi
+if echo "$QUERY_STRING" | grep -q "act=bbp"; then
+	echo "bbp $R $V" > /proc/hd51reg 2>/dev/null
+	echo "<p style='color:#0b8f3f;font-weight:bold'>已执行：BBP[$R] = $V</p>"
+fi
+
+echo '<h3>一键调功率（点一下立即生效，改完看手机信号格）</h3><div class="wrap">'
+for d in 2 4 6 8 10 12 -4 -8; do
+	echo "<a class=g href=\"/cgi-bin/reg?act=tx&d=$d\">TX $d</a>"
+done
+echo "<a class=k href=\"/cgi-bin/reg\">刷新</a></div>"
+
+echo '<h3>直接设成固定档位</h3><div class="wrap">'
+for v in 16 20 24 28 32 36 40 48; do
+	echo "<a class=b href=\"/cgi-bin/reg?act=txset&v=$v\">设 $v</a>"
+done
+echo "</div><p><small>字段含义：6bit，0~63。rt2x00 默认填的是 eeprom 里的值（本机 4~16），
+如果这确实是病根，往上加会立刻看到信号变强。</small></p>"
+
+echo '<h3>BBP 关键寄存器微调</h3><div class="wrap">'
+echo "<a class=b href=\"/cgi-bin/reg?act=bbp&r=66&v=0x1c\">BBP66=0x1c</a>"
+echo "<a class=b href=\"/cgi-bin/reg?act=bbp&r=66&v=0x0c\">BBP66=0x0c</a>"
+echo "<a class=b href=\"/cgi-bin/reg?act=bbp&r=66&v=0x2c\">BBP66=0x2c</a>"
+echo "</div>"
+
+echo '<h3>当前寄存器</h3><pre>'
+cat /proc/hd51reg 2>/dev/null || echo "/proc/hd51reg 不存在（模块没加载）"
+echo '</pre>'
+echo '<h3>已连接站点</h3><pre>'
+iw dev phy0-ap0 station dump 2>&1 | grep -E "Station|signal|bitrate|rx bytes|tx bytes" | head -20
+echo '</pre></body></html>'
 REG_EOF
 chmod +x "$SRC/files/www/cgi-bin/reg"
 
@@ -613,6 +650,10 @@ printf 'obj-m += hd51reg.o\n' > "$PKGD/src/Makefile"
 
 cat > "$PKGD/src/hd51reg.c" << 'C_EOF'
 // SPDX-License-Identifier: GPL-2.0
+// HD51 debug helper: /proc/hd51reg
+//  - raw MAC register dump/read/write (window 0x10180000 + 0x0000..0x1fff)
+//  - BBP register read/write through BBP_CSR_CFG (0x101c)
+//  - TX_PWR_CFG_{0..9} 6-bit field boost / set
 #include <linux/module.h>
 #include <linux/proc_fs.h>
 #include <linux/io.h>
@@ -621,34 +662,143 @@ cat > "$PKGD/src/hd51reg.c" << 'C_EOF'
 #include <linux/kernel.h>
 #include <linux/string.h>
 #include <linux/types.h>
+#include <linux/delay.h>
+#include <linux/errno.h>
 
 #define WMAC_PHYS 0x10180000
-#define WMAC_SIZE 0x0800
+#define WMAC_SIZE 0x4000
+
+#define R_BBP_CSR_CFG   0x101c
+#define BBP_VALUE       (0xffu)
+#define BBP_REGNUM      (0xffu << 8)
+#define BBP_READ_CTRL   (1u << 16)
+#define BBP_BUSY        (1u << 17)
+#define BBP_RW_MODE     (1u << 19)
 
 static void __iomem *base;
-static char last[64] = "no-write-yet\n";
+static char last[96] = "no-write-yet\n";
 
-static int hd51_show(struct seq_file *m, void *v)
+static const u16 txpwr_regs[10] = {
+	0x1314, 0x1318, 0x131c, 0x1320, 0x1324,
+	0x1384, 0x1388,
+	0x13d4, 0x13d8, 0x13dc,
+};
+
+static inline int bbp_wait(void)
 {
-	u32 off;
-	seq_printf(m, "last: %s", last);
-	seq_puts(m, "REG  ADDR        VALUE\n");
-	for (off = 0x500; off <= 0x540; off += 4)
-		seq_printf(m, "0x%03x 0x%08x 0x%08x\n", off,
-			   WMAC_PHYS + off, readl(base + off));
-	seq_puts(m, "\n用法: echo \"w 0x530 0x101\" > /proc/hd51reg\n");
+	int i;
+	for (i = 0; i < 200; i++) {
+		if (!(readl(base + R_BBP_CSR_CFG) & BBP_BUSY))
+			return 0;
+		udelay(5);
+	}
+	return -ETIMEDOUT;
+}
+
+static u8 bbp_read(u16 reg)
+{
+	u32 v;
+	bbp_wait();
+	writel(((reg & 0xff) << 8) | BBP_READ_CTRL | BBP_BUSY | BBP_RW_MODE,
+	       base + R_BBP_CSR_CFG);
+	bbp_wait();
+	v = readl(base + R_BBP_CSR_CFG);
+	return (u8)(v & BBP_VALUE);
+}
+
+static int bbp_write(u16 reg, u8 val)
+{
+	if (bbp_wait())
+		return -ETIMEDOUT;
+	writel((val & BBP_VALUE) | ((reg & 0xff) << 8) | BBP_BUSY | BBP_RW_MODE,
+	       base + R_BBP_CSR_CFG);
+	return bbp_wait();
+}
+
+static void txpwr_dump(struct seq_file *m)
+{
+	u16 i, k;
+	u32 v, f;
+
+	seq_puts(m, "TX_PWR_CFG (6bit fields, 0..63):\n");
+	for (i = 0; i < 10; i++) {
+		v = readl(base + txpwr_regs[i]);
+		seq_printf(m, "  cfg%-2d @0x%04x = 0x%08x  ", i, txpwr_regs[i], v);
+		for (k = 0; k < 4; k++) {
+			f = (v >> (k * 8)) & 0x3f;
+			seq_printf(m, "%2u ", f);
+		}
+		seq_puts(m, "\n");
+	}
+}
+
+static int txpwr_apply(int delta, int absolute)
+{
+	u16 i, k;
+	u32 v, nv, f;
+	int nf;
+
+	for (i = 0; i < 10; i++) {
+		v = readl(base + txpwr_regs[i]);
+		if (v == 0xffffffff || v == 0)
+			continue;
+		nv = v;
+		for (k = 0; k < 4; k++) {
+			f = (v >> (k * 8)) & 0x3f;
+			nf = absolute ? delta : (int)f + delta;
+			if (nf < 0)
+				nf = 0;
+			if (nf > 0x3f)
+				nf = 0x3f;
+			nv &= ~(0x3fu << (k * 8));
+			nv |= ((u32)nf & 0x3f) << (k * 8);
+		}
+		if (nv != v)
+			writel(nv, base + txpwr_regs[i]);
+	}
 	return 0;
 }
+
+static int hd51_show(struct seq_file *m, void *unused)
+{
+	u32 off;
+	static u16 bbps[] = { 1, 4, 20, 66, 86, 105, 241 };
+	unsigned int i;
+
+	seq_printf(m, "last: %s\n", last);
+	seq_puts(m, "--- MAC 寄存器 0x500..0x540 ---\n");
+	for (off = 0x500; off <= 0x540; off += 4)
+		seq_printf(m, "0x%03x  0x%08x\n", off, readl(base + off));
+
+	seq_printf(m, "--- BBP_CSR_CFG @0x101c = 0x%08x ---\n",
+		   readl(base + R_BBP_CSR_CFG));
+
+	txpwr_dump(m);
+
+	seq_puts(m, "--- BBP 关键寄存器 ---\n");
+	for (i = 0; i < ARRAY_SIZE(bbps); i++)
+		seq_printf(m, "BBP[%3u] = 0x%02x\n", bbps[i], bbp_read(bbps[i]));
+
+	seq_puts(m, "\n命令(写入 /proc/hd51reg)：\n"
+		    "  w <addr> <val>       原始 MAC 写，如 w 0x530 0x101\n"
+		    "  bbp <reg> <val>      BBP 写，如 bbp 66 0x1c\n"
+		    "  tx <delta>           TX_PWR_CFG 每个 6bit 字段加 delta（可负），如 tx 6\n"
+		    "  txset <val>          TX_PWR_CFG 每个字段直接设为 val，如 txset 30\n");
+	return 0;
+}
+
 static int hd51_open(struct inode *i, struct file *f)
 {
 	return single_open(f, hd51_show, NULL);
 }
+
 static ssize_t hd51_write(struct file *f, const char __user *buf,
 			  size_t len, loff_t *off)
 {
 	char tmp[64];
 	char *p, *tok;
-	unsigned long addr = 0, val = 0;
+	unsigned long a = 0, b = 0;
+	long sval = 0;
 	int rc;
 
 	if (len >= sizeof(tmp))
@@ -656,31 +806,57 @@ static ssize_t hd51_write(struct file *f, const char __user *buf,
 	if (copy_from_user(tmp, buf, len))
 		return -EFAULT;
 	tmp[len] = 0;
-
 	p = tmp;
 	tok = strsep(&p, " \t\n");
-	if (!tok || tok[0] != 'w' || tok[1] != 0)
-		return -EINVAL;
-	tok = strsep(&p, " \t\n");
 	if (!tok)
-		return -EINVAL;
-	rc = kstrtoul(tok, 0, &addr);
-	if (rc)
-		return -EINVAL;
-	tok = strsep(&p, " \t\n");
-	if (!tok)
-		return -EINVAL;
-	rc = kstrtoul(tok, 0, &val);
-	if (rc)
-		return -EINVAL;
-	if (addr > WMAC_SIZE - 4)
 		return -EINVAL;
 
-	writel((u32)val, base + addr);
-	scnprintf(last, sizeof(last), "wrote 0x%lx=0x%lx, readback 0x%08x\n",
-		  addr, val, readl(base + addr));
-	return len;
+	if (!strcmp(tok, "w")) {
+		char *t1 = strsep(&p, " \t\n"), *t2 = strsep(&p, " \t\n");
+		if (!t1 || !t2)
+			return -EINVAL;
+		if (kstrtoul(t1, 0, &a) || kstrtoul(t2, 0, &b))
+			return -EINVAL;
+		if (a > WMAC_SIZE - 4)
+			return -EINVAL;
+		writel((u32)b, base + a);
+		scnprintf(last, sizeof(last), "W 0x%lx=0x%lx -> 0x%08x\n",
+			  a, b, readl(base + a));
+		return len;
+	}
+
+	if (!strcmp(tok, "bbp")) {
+		char *t1 = strsep(&p, " \t\n"), *t2 = strsep(&p, " \t\n");
+		if (!t1 || !t2)
+			return -EINVAL;
+		if (kstrtoul(t1, 0, &a) || kstrtoul(t2, 0, &b))
+			return -EINVAL;
+		if (a > 0xff)
+			return -EINVAL;
+		rc = bbp_write((u16)a, (u8)b);
+		if (rc)
+			return rc;
+		scnprintf(last, sizeof(last), "BBP[%lu]=0x%02lx -> readback 0x%02x\n",
+			  a, b, bbp_read((u16)a));
+		return len;
+	}
+
+	if (!strcmp(tok, "tx") || !strcmp(tok, "txset")) {
+		char *t1 = strsep(&p, " \t\n");
+		if (!t1)
+			return -EINVAL;
+		if (kstrtol(t1, 0, &sval))
+			return -EINVAL;
+		if (sval < -63 || sval > 63)
+			return -EINVAL;
+		txpwr_apply((int)sval, !strcmp(tok, "txset"));
+		scnprintf(last, sizeof(last), "%s %ld applied\n", tok, sval);
+		return len;
+	}
+
+	return -EINVAL;
 }
+
 static const struct proc_ops hd51_pops = {
 	.proc_open	= hd51_open,
 	.proc_read	= seq_read,
@@ -688,6 +864,7 @@ static const struct proc_ops hd51_pops = {
 	.proc_release	= single_release,
 	.proc_write	= hd51_write,
 };
+
 static int __init hd51reg_init(void)
 {
 	base = ioremap(WMAC_PHYS, WMAC_SIZE);
@@ -697,18 +874,21 @@ static int __init hd51reg_init(void)
 		iounmap(base);
 		return -ENOMEM;
 	}
-	pr_info("hd51reg: wmac mapped, /proc/hd51reg ready\n");
+	pr_info("hd51reg: mapped 0x%x+0x%x, /proc/hd51reg ready\n",
+		WMAC_PHYS, WMAC_SIZE);
 	return 0;
 }
+
 static void __exit hd51reg_exit(void)
 {
 	remove_proc_entry("hd51reg", NULL);
 	iounmap(base);
 }
+
 module_init(hd51reg_init);
 module_exit(hd51reg_exit);
 MODULE_LICENSE("GPL");
-MODULE_DESCRIPTION("HD51 wmac register poking");
+MODULE_DESCRIPTION("HD51 wmac register / BBP / TX power helper");
 C_EOF
 
 add_cfg CONFIG_PACKAGE_kmod-hd51reg
