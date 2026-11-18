@@ -266,7 +266,7 @@ echo "烘入校准文件 $(wc -c < "$SRC/files/lib/firmware/soc_wmac.eeprom") �
 # 版本标记：浏览器打开 http://192.168.1.1/ver.txt 就能确认烧进去的是哪一版
 mkdir -p "$SRC/files/www"
 cat > "$SRC/files/www/ver.txt" << 'VEREOF'
-HD51 v11
+HD51 v12
 build: 2026-11-15
 dts: /delete-property/ ralink,eeprom + ralink,mtd-eeprom = <&factory 0x0>
 wireless: baked (/etc/config/wireless, radio0, SSID HD51, open)
@@ -275,7 +275,7 @@ VEREOF
 
 cat > "$SRC/files/etc/uci-defaults/99-hd51-basic" << 'EOF'
 #!/bin/sh
-uci -q set system.@system[0].hostname='HD51-v11' || true
+uci -q set system.@system[0].hostname='HD51-v12' || true
 uci -q set system.@system[0].timezone='CST-8' || true
 uci -q set system.@system[0].zonename='Asia/Shanghai' || true
 uci -q commit system
@@ -731,5 +731,42 @@ cat /proc/hd51reg
 REG_EOF
 chmod +x "$SRC/files/www/cgi-bin/reg"
 echo "==> v11 内核模块 + reg 页 已写入"
+
+# ---------- 11. v12：diagnostics 页整段重写（寄存器走 /proc/hd51reg，不再用 devmem） ----------
+cat > "$SRC/files/www/cgi-bin/diag" << 'DIAG_EOF'
+#!/bin/sh
+printf 'Content-Type: text/plain; charset=utf-8\n\n'
+echo "===== 时间 ====="
+echo "uptime(秒) = $(cut -d' ' -f1 /proc/uptime)"
+date
+echo
+echo "===== 无线接口 ====="
+iw dev 2>&1
+echo
+echo "===== 已连接站点（AP 收到的 dBm 在这里） ====="
+iw dev phy0-ap0 station dump 2>&1 | head -n 45
+echo
+echo "===== 接口收发计数（tx_packets 涨 = beacon 真发出去了） ====="
+for f in tx_packets tx_bytes tx_errors rx_packets rx_bytes rx_errors; do
+	printf '%-12s %s\n' "$f" "$(cat /sys/class/net/phy0-ap0/statistics/$f 2>/dev/null)"
+done
+echo
+echo "===== RF 寄存器（/proc/hd51reg） ====="
+if [ -e /proc/hd51reg ]; then
+	cat /proc/hd51reg
+else
+	echo "kmod-hd51reg 未加载"
+	lsmod 2>/dev/null | grep -i hd51reg
+fi
+echo
+echo "===== 启动时序（uptime 秒） ====="
+cat /www/timeline.txt 2>/dev/null
+echo
+echo "===== dmesg 无线相关 ====="
+dmesg 2>/dev/null | grep -iE 'rt2x00|rt28|phy0|calib|eeprom|br-lan' | tail -n 40
+DIAG_EOF
+chmod +x "$SRC/files/www/cgi-bin/diag"
+echo "==> v12 diag 页已重写（寄存器走 /proc/hd51reg）"
+
 
 
