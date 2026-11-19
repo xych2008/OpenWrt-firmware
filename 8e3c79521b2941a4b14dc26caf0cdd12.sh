@@ -274,7 +274,7 @@ echo "烘入校准文件 $(wc -c < "$SRC/files/lib/firmware/soc_wmac.eeprom") �
 # 版本标记：浏览器打开 http://192.168.1.1/ver.txt 就能确认烧进去的是哪一版
 mkdir -p "$SRC/files/www"
 cat > "$SRC/files/www/ver.txt" << 'VEREOF'
-HD51 v20
+HD51 v21
 build: 2026-11-15
 dts: /delete-property/ ralink,eeprom + ralink,mtd-eeprom = <&factory 0x0>
 wireless: baked (/etc/config/wireless, radio0, SSID HD51, open)
@@ -335,6 +335,21 @@ add_cfg CONFIG_PACKAGE_kmod-gpio-button-hotplug
 add_cfg CONFIG_PACKAGE_kmod-usb-storage
 add_cfg CONFIG_PACKAGE_kmod-fs-exfat
 add_cfg CONFIG_PACKAGE_urngd
+# v21：SD 卡槽（ramips 自带 mtk_sd 驱动，包名 kmod-sdhci-mt7620）
+add_cfg CONFIG_PACKAGE_kmod-sdhci-mt7620
+add_cfg CONFIG_PACKAGE_kmod-mmc
+# v21：USB 无线网卡三件——RT3070 / AR9271 / MT7612U
+add_cfg CONFIG_PACKAGE_kmod-rt2800-usb
+add_cfg CONFIG_PACKAGE_kmod-ath9k-htc
+add_cfg CONFIG_PACKAGE_kmod-mt76x2u
+# 固件 blob（包名逐版本有差异，多写几个不会有害，缺的会被忽略）
+add_cfg CONFIG_PACKAGE_rt2800-usb-firmware
+add_cfg CONFIG_PACKAGE_ath9k-htc-firmware
+add_cfg CONFIG_PACKAGE_mt76x2u-firmware
+add_cfg CONFIG_PACKAGE_mt76-firmware
+add_cfg CONFIG_PACKAGE_linux-firmware
+# v21：NTFS
+add_cfg CONFIG_PACKAGE_kmod-fs-ntfs3
 add_cfg CONFIG_DEVMEM
 add_cfg CONFIG_BUSYBOX_CONFIG_DEVMEM
 echo "==> .config 已补包（$CFG）"
@@ -976,6 +991,17 @@ cat /www/timeline.txt 2>/dev/null
 echo
 echo "===== dmesg 无线相关 ====="
 dmesg 2>/dev/null | grep -iE 'rt2x00|rt28|phy0|calib|eeprom|br-lan' | tail -n 40
+
+echo "===== USB / SD 设备 ====="
+echo "/proc/partitions:"; cat /proc/partitions 2>/dev/null
+echo "/dev 下的块设备:"; ls -l /dev/sd* /dev/mmcblk* 2>/dev/null || echo "（没有 sd* / mmcblk*）"
+echo "USB 总线与设备:"; ls /sys/bus/usb/devices 2>/dev/null
+echo "无线接口全列表:"; iw dev 2>/dev/null | sed 's/^/  /'
+echo "已装内核模块:"; ls /lib/modules/$(uname -r)/ 2>/dev/null | tr '\n' ' ' | fold -s -w 120
+echo ""
+echo "已装固件 blob:"; ls /lib/firmware 2>/dev/null | tr '\n' ' '
+echo ""
+echo "dmesg USB/MMC 相关:"; dmesg 2>/dev/null | grep -iE 'usb |usb:|usb-|scsi|sd |mmc|mtk_sd|sdhci' | tail -n 40
 DIAG_EOF
 chmod +x "$SRC/files/www/cgi-bin/diag"
 echo "==> v12 diag 页已重写（寄存器走 /proc/hd51reg）"
