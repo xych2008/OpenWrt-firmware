@@ -266,7 +266,7 @@ echo "烘入校准文件 $(wc -c < "$SRC/files/lib/firmware/soc_wmac.eeprom") �
 # 版本标记：浏览器打开 http://192.168.1.1/ver.txt 就能确认烧进去的是哪一版
 mkdir -p "$SRC/files/www"
 cat > "$SRC/files/www/ver.txt" << 'VEREOF'
-HD51 v14
+HD51 v15
 build: 2026-11-15
 dts: /delete-property/ ralink,eeprom + ralink,mtd-eeprom = <&factory 0x0>
 wireless: baked (/etc/config/wireless, radio0, SSID HD51, open)
@@ -275,7 +275,7 @@ VEREOF
 
 cat > "$SRC/files/etc/uci-defaults/99-hd51-basic" << 'EOF'
 #!/bin/sh
-uci -q set system.@system[0].hostname='HD51-v14' || true
+uci -q set system.@system[0].hostname='HD51-v15' || true
 uci -q set system.@system[0].timezone='CST-8' || true
 uci -q set system.@system[0].zonename='Asia/Shanghai' || true
 uci -q commit system
@@ -492,6 +492,10 @@ if echo "$QUERY_STRING" | grep -q "act=txset"; then
 	echo "txset $V" > /proc/hd51reg 2>/dev/null
 	echo "<p style='color:#0b8f3f;font-weight:bold'>已执行：TX 功率字段 = $V</p>"
 fi
+if echo "$QUERY_STRING" | grep -q "act=bit20"; then
+	echo "bit20 $V" > /proc/hd51reg 2>/dev/null
+	echo "<p style='color:#0b8f3f;font-weight:bold'>已执行：GPIO_MODE bit20 = $V</p>"
+fi
 if echo "$QUERY_STRING" | grep -q "act=bbp"; then
 	echo "bbp $R $V" > /proc/hd51reg 2>/dev/null
 	echo "<p style='color:#0b8f3f;font-weight:bold'>已执行：BBP[$R] = $V</p>"
@@ -516,6 +520,10 @@ echo "<a class=b href=\"/cgi-bin/reg?act=bbp&r=66&v=0x0c\">BBP66=0x0c</a>"
 echo "<a class=b href=\"/cgi-bin/reg?act=bbp&r=66&v=0x2c\">BBP66=0x2c</a>"
 echo "</div>"
 
+echo '<h3>SoC 针脚（原厂驱动会动态切换第 20 脚）</h3><div class="wrap">'
+echo "<a class=b href=\"/cgi-bin/reg?act=bit20&v=0\">清 bit20（厂商 ExtPA 做法）</a>"
+echo "<a class=r href=\"/cgi-bin/reg?act=bit20&v=1\">置 bit20（GPIO 模式）</a>"
+echo '</div>'
 echo '<h3>当前寄存器</h3><pre>'
 cat /proc/hd51reg 2>/dev/null || echo "/proc/hd51reg 不存在（模块没加载）"
 echo '</pre>'
@@ -634,6 +642,8 @@ cat > "$PKGD/src/hd51reg.c" << 'C_EOF'
 
 #define WMAC_PHYS 0x10180000
 #define WMAC_SIZE 0x4000
+#define SYSC_PHYS 0x10000000
+#define SYSC_SIZE 0x1000
 
 #define R_BBP_CSR_CFG   0x101c
 #define BBP_VALUE       (0xffu)
@@ -643,6 +653,7 @@ cat > "$PKGD/src/hd51reg.c" << 'C_EOF'
 #define BBP_RW_MODE     (1u << 19)
 
 static void __iomem *base;
+static void __iomem *sysc;
 static char last[96] = "no-write-yet\n";
 
 static const u16 txpwr_regs[10] = {
@@ -742,6 +753,15 @@ static int hd51_show(struct seq_file *m, void *unused)
 
 	txpwr_dump(m);
 
+	seq_puts(m, "--- SoC SYSC / GPIO ---\n");
+	seq_printf(m, "0x1000000c (SYSC)      = 0x%08x\n", readl(sysc + 0x0c));
+	seq_printf(m, "0x10000010 (SYSC)      = 0x%08x\n", readl(sysc + 0x10));
+	seq_printf(m, "0x10000060 (GPIO_MODE)= 0x%08x   bit20=%d\n",
+		   readl(sysc + 0x60), (readl(sysc + 0x60) >> 20) & 1);
+	for (off = 0x600; off <= 0x640; off += 4)
+		seq_printf(m, "0x1000%03x (GPIO)      = 0x%08x\n", off,
+			   readl(sysc + off));
+
 	seq_puts(m, "--- BBP 关键寄存器 ---\n");
 	for (i = 0; i < ARRAY_SIZE(bbps); i++)
 		seq_printf(m, "BBP[%3u] = 0x%02x\n", bbps[i], bbp_read(bbps[i]));
@@ -808,6 +828,38 @@ static ssize_t hd51_write(struct file *f, const char __user *buf,
 		return len;
 	}
 
+	if (!strcmp(tok, "sysc")) {
+		char *t1 = strsep(&p, " \t\n"), *t2 = strsep(&p, " \t\n");
+		if (!t1 || !t2)
+			return -EINVAL;
+		if (kstrtoul(t1, 0, &a) || kstrtoul(t2, 0, &b))
+			return -EINVAL;
+		if (a > SYSC_SIZE - 4)
+			return -EINVAL;
+		writel((u32)b, sysc + a);
+		scnprintf(last, sizeof(last), "SYSC 0x%lx=0x%lx -> 0x%08x\n",
+			  a, b, readl(sysc + a));
+		return len;
+	}
+
+	if (!strcmp(tok, "bit20")) {
+		char *t1 = strsep(&p, " \t\n");
+		u32 v;
+		if (!t1)
+			return -EINVAL;
+		if (kstrtoul(t1, 0, &b))
+			return -EINVAL;
+		v = readl(sysc + 0x60);
+		if (b)
+			v |= (1u << 20);
+		else
+			v &= ~(1u << 20);
+		writel(v, sysc + 0x60);
+		scnprintf(last, sizeof(last), "GPIO_MODE bit20=%lu -> 0x%08x\n",
+			  b, readl(sysc + 0x60));
+		return len;
+	}
+
 	if (!strcmp(tok, "tx") || !strcmp(tok, "txset")) {
 		char *t1 = strsep(&p, " \t\n");
 		if (!t1)
@@ -835,10 +887,15 @@ static const struct proc_ops hd51_pops = {
 static int __init hd51reg_init(void)
 {
 	base = ioremap(WMAC_PHYS, WMAC_SIZE);
-	if (!base)
+	sysc = ioremap(SYSC_PHYS, SYSC_SIZE);
+	if (!base || !sysc) {
+		if (base) iounmap(base);
+		if (sysc) iounmap(sysc);
 		return -ENOMEM;
+	}
 	if (!proc_create("hd51reg", 0644, NULL, &hd51_pops)) {
 		iounmap(base);
+	iounmap(sysc);
 		return -ENOMEM;
 	}
 	pr_info("hd51reg: mapped 0x%x+0x%x, /proc/hd51reg ready\n",
@@ -850,6 +907,7 @@ static void __exit hd51reg_exit(void)
 {
 	remove_proc_entry("hd51reg", NULL);
 	iounmap(base);
+	iounmap(sysc);
 }
 
 module_init(hd51reg_init);
