@@ -274,7 +274,7 @@ echo "烘入校准文件 $(wc -c < "$SRC/files/lib/firmware/soc_wmac.eeprom") �
 # 版本标记：浏览器打开 http://192.168.1.1/ver.txt 就能确认烧进去的是哪一版
 mkdir -p "$SRC/files/www"
 cat > "$SRC/files/www/ver.txt" << 'VEREOF'
-HD51 v17
+HD51 v19
 build: 2026-11-15
 dts: /delete-property/ ralink,eeprom + ralink,mtd-eeprom = <&factory 0x0>
 wireless: baked (/etc/config/wireless, radio0, SSID HD51, open)
@@ -977,6 +977,10 @@ start() {
 	i=0
 	while [ ! -e /proc/hd51reg ] && [ $i -lt 60 ]; do sleep 1; i=$((i+1)); done
 	log "hd51reg 就绪"
+	log "GPIO_MODE 清位前：$(grep -m1 'GPIO_MODE' /proc/hd51reg)"
+	echo "bit20 0" > /proc/hd51reg 2>/dev/null
+	sleep 1
+	log "GPIO_MODE 清位后：$(grep -m1 'GPIO_MODE' /proc/hd51reg)"
 	i=0
 	while [ ! -e /sys/class/net/phy0-ap0 ] && [ $i -lt 300 ]; do sleep 1; i=$((i+1)); done
 	log "phy0-ap0 出现（此刻 AP 才开始广播）"
@@ -986,6 +990,7 @@ start() {
 	sleep 1
 	log "补功率后：$(grep -m1 -i '1314\|PWR_CFG_0' /proc/hd51reg)"
 	log "完成"
+	dmesg > /www/dmesg.txt 2>/dev/null
 }
 stop() { :; }
 RF_EOF
