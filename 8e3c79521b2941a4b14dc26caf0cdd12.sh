@@ -274,7 +274,7 @@ echo "烘入校准文件 $(wc -c < "$SRC/files/lib/firmware/soc_wmac.eeprom") �
 # 版本标记：浏览器打开 http://192.168.1.1/ver.txt 就能确认烧进去的是哪一版
 mkdir -p "$SRC/files/www"
 cat > "$SRC/files/www/ver.txt" << 'VEREOF'
-HD51 v19
+HD51 v20
 build: 2026-11-15
 dts: /delete-property/ ralink,eeprom + ralink,mtd-eeprom = <&factory 0x0>
 wireless: baked (/etc/config/wireless, radio0, SSID HD51, open)
@@ -334,6 +334,7 @@ add_cfg CONFIG_PACKAGE_kmod-usb-ohci
 add_cfg CONFIG_PACKAGE_kmod-gpio-button-hotplug
 add_cfg CONFIG_PACKAGE_kmod-usb-storage
 add_cfg CONFIG_PACKAGE_kmod-fs-exfat
+add_cfg CONFIG_PACKAGE_urngd
 add_cfg CONFIG_DEVMEM
 add_cfg CONFIG_BUSYBOX_CONFIG_DEVMEM
 echo "==> .config 已补包（$CFG）"
@@ -553,6 +554,21 @@ start() {
 boot() { start; }
 MARK_EOF
 chmod +x "$SRC/files/etc/init.d/hd51m$n"
+done
+
+# v20：在 START=19 那一组（dnsmasq/dropbear/firewall/wpad）里插针，逐脚本计时
+# 文件名决定排序：S19aa1 < S19dnsmasq < S19dnz < S19dropbear < S19drz < S19firewall < S19fiz < S19wpad < S19wpz
+for spec in "aa1:19 组开始" "dnz:dnsmasq 之后" "drz:dropbear 之后" "fiz:firewall 之后" "wpz:wpad 之后"; do
+	n=${spec%%:*}; lab=${spec#*:}
+cat > "$SRC/files/etc/init.d/$n" << MARK_EOF
+#!/bin/sh /etc/rc.common
+START=19
+start() {
+	echo "[\$(cut -d' ' -f1 /proc/uptime)s] 19组打点 $lab" >> /www/timeline.txt
+}
+boot() { start; }
+MARK_EOF
+chmod +x "$SRC/files/etc/init.d/$n"
 done
 
 cat > "$SRC/files/usr/bin/hd51-watch.sh" << 'W_EOF'
