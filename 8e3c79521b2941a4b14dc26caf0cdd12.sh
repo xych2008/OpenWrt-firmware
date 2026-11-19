@@ -260,8 +260,8 @@ cat > "$SRC/files/lib/firmware/soc_wmac.eeprom.b64" << 'CALEOF'
 IHYFAYyISwBTiv///////////////////////////////////////4yISwBTiIyISwBTiSIMBMD/
 /x4BVXeoqoyI//8KAAAAAAAAAAAA/////xAQDw8ODg4ODw8PDw8PExMTEhISEhMTFBQUFBSA////
 gP///wAA////////////////////////////////////////////////////////////////////
-/////////////////////////////////////////////////yD/////////////////Dg4ODgoG
-DQ0KBg4OCgYNDQoGPz//////////////////////////////////////////////////////////
+/////////////////////////////////////////////////yD/////////////////CAgICAQA
+BwcEAAgIBAAHBwQA////////////////////////////////////////////////////////////
 ////////////////////////////////////////////////////////////////////////////
 ////////////////////////////////////////////////////////////////////////////
 ////////////////////////////////////////////////////////////////////////////
@@ -274,7 +274,7 @@ echo "烘入校准文件 $(wc -c < "$SRC/files/lib/firmware/soc_wmac.eeprom") �
 # 版本标记：浏览器打开 http://192.168.1.1/ver.txt 就能确认烧进去的是哪一版
 mkdir -p "$SRC/files/www"
 cat > "$SRC/files/www/ver.txt" << 'VEREOF'
-HD51 v16
+HD51 v17
 build: 2026-11-15
 dts: /delete-property/ ralink,eeprom + ralink,mtd-eeprom = <&factory 0x0>
 wireless: baked (/etc/config/wireless, radio0, SSID HD51, open)
@@ -519,8 +519,8 @@ echo '<h3>直接设成固定档位</h3><div class="wrap">'
 for v in 16 20 24 28 32 36 40 48; do
 	echo "<a class=b href=\"/cgi-bin/reg?act=txset&v=$v\">设 $v</a>"
 done
-echo "</div><p><small>字段含义：6bit，0~63。rt2x00 默认填的是 eeprom 里的值（本机 4~16），
-如果这确实是病根，往上加会立刻看到信号变强。</small></p>"
+echo "</div><p><small>字段含义：6bit，0~63。**相对增量才有用**（点 TX +6 实测满格）；
+下半排"设 16~48"是绝对档位，设大反而更弱，仅作对照实验。</small></p>"
 
 echo '<h3>BBP 关键寄存器微调</h3><div class="wrap">'
 echo "<a class=b href=\"/cgi-bin/reg?act=bbp&r=66&v=0x1c\">BBP66=0x1c</a>"
@@ -963,6 +963,35 @@ dmesg 2>/dev/null | grep -iE 'rt2x00|rt28|phy0|calib|eeprom|br-lan' | tail -n 40
 DIAG_EOF
 chmod +x "$SRC/files/www/cgi-bin/diag"
 echo "==> v12 diag 页已重写（寄存器走 /proc/hd51reg）"
+
+# ---------- 12. v17：射频起来后自动补功率 +6，并记录启动耗时 ----------
+mkdir -p "$SRC/files/etc/init.d"
+cat > "$SRC/files/etc/init.d/hd51rf" << 'RF_EOF'
+#!/bin/sh /etc/rc.common
+START=99
+LOG=/www/bootlog.txt
+log() { echo "$(cut -d' ' -f1 /proc/uptime)s  $*" >> $LOG; }
+start() {
+	echo "hd51rf v17 boot $(date '+%F %T')" > $LOG
+	log "init 起点"
+	i=0
+	while [ ! -e /proc/hd51reg ] && [ $i -lt 60 ]; do sleep 1; i=$((i+1)); done
+	log "hd51reg 就绪"
+	i=0
+	while [ ! -e /sys/class/net/phy0-ap0 ] && [ $i -lt 300 ]; do sleep 1; i=$((i+1)); done
+	log "phy0-ap0 出现（此刻 AP 才开始广播）"
+	sleep 5
+	log "补功率前：$(grep -m1 -i '1314\|PWR_CFG_0' /proc/hd51reg)"
+	echo "tx 6" > /proc/hd51reg 2>/dev/null
+	sleep 1
+	log "补功率后：$(grep -m1 -i '1314\|PWR_CFG_0' /proc/hd51reg)"
+	log "完成"
+}
+stop() { :; }
+RF_EOF
+chmod +x "$SRC/files/etc/init.d/hd51rf"
+echo "==> v17 射频补功率脚本已写入"
+
 
 
 
