@@ -274,7 +274,7 @@ echo "烘入校准文件 $(wc -c < "$SRC/files/lib/firmware/soc_wmac.eeprom") �
 # 版本标记：浏览器打开 http://192.168.1.1/ver.txt 就能确认烧进去的是哪一版
 mkdir -p "$SRC/files/www"
 cat > "$SRC/files/www/ver.txt" << 'VEREOF'
-HD51 v21
+HD51 v22
 build: 2026-11-15
 dts: /delete-property/ ralink,eeprom + ralink,mtd-eeprom = <&factory 0x0>
 wireless: baked (/etc/config/wireless, radio0, SSID HD51, open)
@@ -350,6 +350,23 @@ add_cfg CONFIG_PACKAGE_mt76-firmware
 add_cfg CONFIG_PACKAGE_linux-firmware
 # v21：NTFS
 add_cfg CONFIG_PACKAGE_kmod-fs-ntfs3
+# v22：SD 当 overlay / 大文件仓库所需
+add_cfg CONFIG_PACKAGE_kmod-fs-ext4
+add_cfg CONFIG_PACKAGE_kmod-fs-f2fs
+add_cfg CONFIG_PACKAGE_e2fsprogs
+add_cfg CONFIG_PACKAGE_f2fs-tools
+add_cfg CONFIG_PACKAGE_block-mount
+add_cfg CONFIG_PACKAGE_swap-utils
+add_cfg CONFIG_PACKAGE_blkid
+# v22：USB 外设利用——4G/网卡共享、串口
+add_cfg CONFIG_PACKAGE_kmod-usb-net
+add_cfg CONFIG_PACKAGE_kmod-usb-net-cdc-ether
+add_cfg CONFIG_PACKAGE_kmod-usb-net-cdc-ncm
+add_cfg CONFIG_PACKAGE_kmod-usb-net-rndis
+add_cfg CONFIG_PACKAGE_kmod-usb-serial
+add_cfg CONFIG_PACKAGE_kmod-usb-serial-option
+add_cfg CONFIG_PACKAGE_kmod-usb-serial-pl2303
+add_cfg CONFIG_PACKAGE_kmod-usb-serial-ch341
 add_cfg CONFIG_DEVMEM
 add_cfg CONFIG_BUSYBOX_CONFIG_DEVMEM
 echo "==> .config 已补包（$CFG）"
@@ -1008,6 +1025,79 @@ echo "==> v12 diag 页已重写（寄存器走 /proc/hd51reg）"
 
 # ---------- 12. v17：射频起来后自动补功率 +6，并记录启动耗时 ----------
 mkdir -p "$SRC/files/etc/init.d"
+# ---------- v22：SD 预处理 + 双射频钥匙 ----------
+mkdir -p "$SRC/files/root" "$SRC/files/etc/config"
+
+cat > "$SRC/files/root/sd-prep.sh" << 'SD_EOF'
+#!/bin/sh
+# SD 卡一键准备（只在你说 yes 之后才动手，绝不自动格式化）
+CARD=/dev/mmcblk0
+[ -b "$CARD" ] || { echo "没检测到 SD 卡（/dev/mmcblk0 不存在）"; exit 1; }
+echo "检测到 SD 卡："; ls -l "$CARD" "$CARD"p* 2>/dev/null
+echo
+echo "将要在 $CARD 上：建一个主分区 -> 格式化成 ext4（卷标 overlay）-> 配成 /overlay"
+echo "注意：卡上原有数据会被清空！"
+printf "确认请输入 yes 回车："; read -r A
+[ "$A" = "yes" ] || { echo "已取消，什么都没做"; exit 0; }
+
+echo "==> 建分区"
+printf 'o\nn\np\n1\n\n\nw\n' | fdisk "$CARD" >/dev/null 2>&1 || { echo "fdisk 失败"; exit 1; }
+sleep 1
+PART="${CARD}p1"
+[ -b "$PART" ] || PART="$CARD"
+mkfs.ext4 -F -L overlay "$PART" || { echo "mkfs.ext4 失败"; exit 1; }
+
+echo "==> 写 /etc/config/fstab"
+cat > /etc/config/fstab << 'F_EOF'
+config 'global'
+	option	anon_swap	'0'
+	option	anon_mount	'0'
+	option	auto_swap	'0'
+	option	auto_mount	'0'
+	option	delay_root	'5'
+	option	check_fs	'0'
+
+config 'mount'
+	option	target	'/overlay'
+	option	device	'/dev/mmcblk0p1'
+	option	fstype	'ext4'
+	option	options	'rw'
+	option	enabled	'1'
+F_EOF
+sync
+echo "==> 完成。重启后 /overlay 就在 SD 卡上（32G 空间可用）。"
+echo "    若要取消：删掉 /etc/config/fstab 里那段 mount 即可。"
+SD_EOF
+chmod +x "$SRC/files/root/sd-prep.sh"
+
+cat > "$SRC/files/root/dual-radio.sh" << 'DR_EOF'
+#!/bin/sh
+# 双射频：外置 USB 网卡开监听，板载 rt2800 继续当 AP（热点不断）
+set -e
+echo "== 当前无线接口 =="
+iw dev | sed 's/^/  /'
+PHYS=$(ls /sys/class/ieee80211/ 2>/dev/null)
+echo "物理射频: $PHYS"
+EXT=""
+for ph in $PHYS; do
+	case "$ph" in
+		phy0) ;;              # 板载，留给 AP
+		*) EXT="$ph" ;;
+	esac
+done
+[ -n "$EXT" ] || { echo "没有外置射频（板载 phy0 不参与监听，避免断热点）"; exit 1; }
+echo "==> 用外置 $EXT 建监听口"
+iw dev mon0 del >/dev/null 2>&1 || true
+iw phy "$EXT" interface add mon0 type monitor
+ip link set mon0 up
+sleep 1
+iw dev mon0 info | sed 's/^/  /'
+echo "==> 注入自检（5 秒探针，不针对任何具体目标）"
+aireplay-ng --test mon0 2>&1 | head -6 || echo "（aireplay-ng 未装，跳过）"
+echo "完成：mon0 = 外置卡监听；板载 AP 未动，手机连接不受影响。"
+DR_EOF
+chmod +x "$SRC/files/root/dual-radio.sh"
+
 cat > "$SRC/files/etc/init.d/hd51rf" << 'RF_EOF'
 #!/bin/sh /etc/rc.common
 START=99
