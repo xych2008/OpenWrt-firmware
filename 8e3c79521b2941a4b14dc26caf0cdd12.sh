@@ -274,8 +274,8 @@ echo "烘入校准文件 $(wc -c < "$SRC/files/lib/firmware/soc_wmac.eeprom") �
 # 版本标记：浏览器打开 http://192.168.1.1/ver.txt 就能确认烧进去的是哪一版
 mkdir -p "$SRC/files/www"
 cat > "$SRC/files/www/ver.txt" << 'VEREOF'
-HD51 v23
-build: 2026-11-15
+HD51 v25
+build: 2026-11-20
 dts: /delete-property/ ralink,eeprom + ralink,mtd-eeprom = <&factory 0x0>
 wireless: baked (/etc/config/wireless, radio0, SSID HD51, open)
 sd: &sdhci status=okay
@@ -347,8 +347,10 @@ add_cfg CONFIG_PACKAGE_kmod-gpio-button-hotplug
 add_cfg CONFIG_PACKAGE_kmod-usb-storage
 add_cfg CONFIG_PACKAGE_kmod-fs-exfat
 add_cfg CONFIG_PACKAGE_urngd
-# v23：SD 驱动整体摘掉（v22 刷入后起不来，怀疑 mtk_sd probe 卡死/引脚冲突）
-# 待单独验证：不自动加载的 mtk_sd 版本另出一包
+# v25：SD 卡槽驱动恢复（两行与 v22 完全一致；v22 那次"起不来"已查明是 5 分钟慢启动，不是 SD 的锅）
+# DTS 里 &sdhci status=okay 早已在位，驱动装上即可识卡
+add_cfg CONFIG_PACKAGE_kmod-sdhci-mt7620
+add_cfg CONFIG_PACKAGE_kmod-mmc
 # v21：USB 无线网卡三件——RT3070 / AR9271 / MT7612U
 add_cfg CONFIG_PACKAGE_kmod-rt2800-usb
 add_cfg CONFIG_PACKAGE_kmod-ath9k-htc
