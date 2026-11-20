@@ -278,7 +278,7 @@ echo "烘入校准文件 $(wc -c < "$SRC/files/lib/firmware/soc_wmac.eeprom") �
 # 版本标记：浏览器打开 http://192.168.1.1/ver.txt 就能确认烧进去的是哪一版
 mkdir -p "$SRC/files/www"
 cat > "$SRC/files/www/ver.txt" << 'VEREOF'
-HD51 v28
+HD51 v29
 build: 2026-11-20
 dts: /delete-property/ ralink,eeprom + ralink,mtd-eeprom = <&factory 0x0>
 wireless: baked (/etc/config/wireless, radio0, SSID HD51, open)
@@ -324,12 +324,142 @@ fi
 MSKEY
 chmod 755 "$SRC/files/root/modesw.sh"
 
+# ===== v29：手机管理存储（SMB + FTP）=====
+# 注意：ksmbd 的 init 会按 UCI(/etc/config/ksmbd) 重新生成 /var/etc/ksmbd/ksmbd.conf，
+#       手写 /etc/ksmbd/ksmbd.conf 会被判为"自定义文件"而忽略 UCI，故这里只写 UCI
+mkdir -p "$SRC/files/etc/config" "$SRC/files/etc" "$SRC/files/etc/init.d" "$SRC/files/root"
+
+cat > "$SRC/files/etc/config/ksmbd" << 'KSMBC'
+config globals
+	option workgroup 'WORKGROUP'
+	option description 'HD51'
+	option interface 'lan'
+	option allow_legacy_protocols '1'
+
+config share
+	option name 'HD51-DATA'
+	option path '/data'
+	option read_only 'no'
+	option guest_ok 'yes'
+	option create_mask '0666'
+	option dir_mask '0777'
+	option force_root '1'
+
+config share
+	option name 'HD51-USB'
+	option path '/mnt/sda1'
+	option read_only 'no'
+	option guest_ok 'yes'
+	option create_mask '0666'
+	option dir_mask '0777'
+	option force_root '1'
+KSMBC
+
+cat > "$SRC/files/etc/vsftpd.conf" << 'FTPC'
+background=YES
+listen=YES
+listen_port=2121
+anonymous_enable=YES
+anon_root=/data
+no_anon_password=YES
+write_enable=YES
+anon_upload_enable=YES
+anon_mkdir_write_enable=YES
+anon_other_write_enable=YES
+local_enable=NO
+pasv_enable=YES
+pasv_min_port=50000
+pasv_max_port=50100
+seccomp_sandbox=NO
+FTPC
+
+# 每次开机先建好共享目录（initramfs 模式不持久化，必须每boot都建）
+cat > "$SRC/files/etc/init.d/datadir" << 'DINIT'
+#!/bin/sh /etc/rc.common
+START=97
+boot() {
+	mkdir -p /data /mnt/sda1
+	chmod 777 /data 2>/dev/null
+}
+DINIT
+chmod 755 "$SRC/files/etc/init.d/datadir"
+
+# 7612 ZeroCD 开机重试
+cat > "$SRC/files/etc/init.d/umretry" << 'UMR'
+#!/bin/sh /etc/rc.common
+START=99
+boot() {
+	(
+	i=0
+	while [ $i -lt 12 ]; do
+		pid=$(cat /sys/bus/usb/devices/1-1/idProduct 2>/dev/null)
+		if [ -z "$pid" ]; then sleep 5; i=$((i+1)); continue; fi
+		[ "$pid" = "2870" ] || break
+		/sbin/usbmode -s >/dev/null 2>&1
+		sleep 5
+		i=$((i+1))
+	done
+	echo "umretry end idProduct=$(cat /sys/bus/usb/devices/1-1/idProduct 2>/dev/null)" >> /www/umretry.log
+	) &
+}
+UMR
+chmod 755 "$SRC/files/etc/init.d/umretry"
+
+cat > "$SRC/files/root/share.sh" << 'SHKEY'
+#!/bin/sh
+mkdir -p /data /mnt/sda1 2>/dev/null
+chmod 777 /data 2>/dev/null
+case "$1" in
+	off)
+		/etc/init.d/ksmbd stop 2>/dev/null
+		/etc/init.d/vsftpd stop 2>/dev/null
+		echo "共享已停"
+		exit 0 ;;
+esac
+/etc/init.d/ksmbd restart 2>/dev/null
+/etc/init.d/vsftpd restart 2>/dev/null
+IP=$(uci -q get network.lan.ipaddr 2>/dev/null)
+[ -n "$IP" ] || IP=192.168.1.1
+echo "===== 共享已开 ====="
+echo "SMB  地址: $IP    共享名: HD51-DATA  (根目录 /data, 在 SD 上)"
+echo "SMB  地址: $IP    共享名: HD51-USB   (根目录 /mnt/sda1, U 盘)"
+echo "FTP  地址: ftp://$IP:2121   (匿名, 根目录 /data)"
+echo "===== 挂载情况 ====="
+df -h /data /mnt/sda1 2>/dev/null
+echo "===== SMB 会话 ====="
+cat /proc/fs/ksmbd/sessions 2>/dev/null | head -5
+echo "===== 服务进程 ====="
+ps 2>/dev/null | grep -E 'ksmbd|vsftpd' | grep -v grep
+echo "===== 最近报错 ====="
+logread 2>/dev/null | grep -iE 'ksmbd|vsftpd' | tail -5
+SHKEY
+chmod 755 "$SRC/files/root/share.sh"
+
 cat > "$SRC/files/etc/uci-defaults/99-hd51-basic" << 'EOF'
 #!/bin/sh
 uci -q set system.@system[0].hostname='HD51-v16' || true
 uci -q set system.@system[0].timezone='CST-8' || true
 uci -q set system.@system[0].zonename='Asia/Shanghai' || true
 uci -q commit system
+
+# v29：共享目录 + U 盘匿名挂载 + 服务自启
+mkdir -p /data /mnt/sda1
+chmod 777 /data 2>/dev/null
+if [ ! -f /etc/config/fstab ]; then
+	printf 'config global\n\toption anon_mount 1\n' > /etc/config/fstab
+elif ! grep -q 'config global' /etc/config/fstab; then
+	printf '\nconfig global\n\toption anon_mount 1\n' >> /etc/config/fstab
+else
+	uci -q set fstab.@global[0].anon_mount='1'
+	uci -q commit fstab
+fi
+# FTP 匿名映射用户 ftp 必须存在，否则 vsftpd 拒绝启动
+grep -q '^ftp:' /etc/passwd 2>/dev/null || echo 'ftp:x:21:21:ftp:/var:/bin/false' >> /etc/passwd
+mkdir -p /var/run/vsftpd
+/etc/init.d/datadir enable 2>/dev/null || true
+/etc/init.d/ksmbd enable 2>/dev/null || true
+/etc/init.d/vsftpd enable 2>/dev/null || true
+/etc/init.d/umretry enable 2>/dev/null || true
 
 # 兜底：万一 phy 不在 radio0 上，按探测结果补一次
 [ -f /etc/config/wireless ] || wifi config >/dev/null 2>&1
@@ -385,6 +515,9 @@ add_cfg CONFIG_PACKAGE_kmod-mmc
 # v26：MT7612U 的 ZeroCD 弹出（0e8d:2870 假光驱 -> 0e8d:7612 WiFi）
 add_cfg CONFIG_PACKAGE_usb-modeswitch
 add_cfg CONFIG_PACKAGE_usb-modeswitch-data
+# v29：手机管理 SD/USB —— SMB（ksmbd，内核级，轻） + FTP（vsftpd，备选）
+add_cfg CONFIG_PACKAGE_ksmbd-server
+add_cfg CONFIG_PACKAGE_vsftpd
 
 # v26：TF 卡槽卡检测改软件轮询（HD51 的 CD 脚很可能未接入 SoC，CD_POLL=n 时永远认为无卡）
 MK="$SRC/target/linux/ramips/modules.mk"
@@ -1095,6 +1228,35 @@ echo ""
 echo "已装固件 blob:"; ls /lib/firmware 2>/dev/null | tr '\n' ' '
 echo ""
 echo "dmesg USB/MMC 相关:"; dmesg 2>/dev/null | grep -iE 'usb |usb:|usb-|scsi|sd |mmc|mtk_sd|sdhci' | tail -n 40
+
+echo
+echo "===== 存储：mount / df ====="
+grep -E 'overlay|/data|mmcblk|mmc0|/mnt/sda' /proc/mounts 2>/dev/null || echo "（无相关挂载）"
+df -h 2>/dev/null | grep -vE 'tmpfs|proc|sysfs'
+echo "块设备节点:"; ls -l /dev/mmcblk* /dev/sd* 2>/dev/null
+echo "blkid（看 ext4 标签是否为 overlay）:"; blkid 2>/dev/null
+echo "fstab:"; cat /etc/config/fstab 2>/dev/null || echo "（无 /etc/config/fstab）"
+echo
+echo "===== 共享目录 ====="
+ls -ld /data /mnt/sda1 2>/dev/null
+echo "/data 内容:"; ls -a /data 2>/dev/null | head -n 20
+
+echo
+echo "===== 服务：监听端口 / 进程 ====="
+netstat -lnt 2>/dev/null | grep -E ':(22|445|139|2121)' || echo "（22/445/139/2121 均未监听）"
+ps w 2>/dev/null | grep -E 'ksmbd|smbd|vsftpd|dropbear' | grep -v grep
+echo "dropbear 密钥文件:"; ls -l /etc/dropbear/ 2>/dev/null
+echo
+echo "===== ksmbd 生成的配置 ====="
+ls -l /var/etc/ksmbd/ 2>/dev/null
+cat /var/etc/ksmbd/ksmbd.conf 2>/dev/null | head -n 40
+echo
+echo "===== umretry.log（7612 ZeroCD 重试） ====="
+cat /www/umretry.log 2>/dev/null || echo "（无日志，说明没触发或服务未起）"
+echo
+echo "===== rc.d 启停顺序 ====="
+ls /etc/rc.d/ 2>/dev/null | tr '\n' ' '
+echo
 DIAG_EOF
 chmod +x "$SRC/files/www/cgi-bin/diag"
 echo "==> v12 diag 页已重写（寄存器走 /proc/hd51reg）"
@@ -1127,7 +1289,7 @@ echo "==> 写 /etc/config/fstab"
 cat > /etc/config/fstab << 'F_EOF'
 config 'global'
 	option	anon_swap	'0'
-	option	anon_mount	'0'
+	option	anon_mount	'1'
 	option	auto_swap	'0'
 	option	auto_mount	'0'
 	option	delay_root	'5'
@@ -1141,7 +1303,9 @@ config 'mount'
 	option	enabled	'1'
 F_EOF
 sync
-echo "==> 完成。重启后 /overlay 就在 SD 卡上（32G 空间可用）。"
+echo "==> 完成。重启后 /overlay 就在 SD 卡上（30G 空间可用）。"
+echo "    !! 前提：本固件必须是 sysupgrade（squashfs）刷的。initramfs 全部在内存里，"
+echo "       写进 /etc 的东西重启就没了，SD 永远不会成为 overlay。"
 echo "    若要取消：删掉 /etc/config/fstab 里那段 mount 即可。"
 SD_EOF
 chmod +x "$SRC/files/root/sd-prep.sh"
