@@ -274,7 +274,7 @@ echo "烘入校准文件 $(wc -c < "$SRC/files/lib/firmware/soc_wmac.eeprom") �
 # 版本标记：浏览器打开 http://192.168.1.1/ver.txt 就能确认烧进去的是哪一版
 mkdir -p "$SRC/files/www"
 cat > "$SRC/files/www/ver.txt" << 'VEREOF'
-HD51 v25
+HD51 v26
 build: 2026-11-20
 dts: /delete-property/ ralink,eeprom + ralink,mtd-eeprom = <&factory 0x0>
 wireless: baked (/etc/config/wireless, radio0, SSID HD51, open)
@@ -292,6 +292,40 @@ cat > "$SRC/files/usr/bin/dropbearkey" << 'DBKEOF'
 exit 0
 DBKEOF
 chmod 755 "$SRC/files/usr/bin/dropbearkey"
+
+# ===== v26：7612 ZeroCD 规则与钥匙 =====
+mkdir -p "$SRC/files/usr/share/usb_modeswitch" "$SRC/files/etc/usb_modeswitch.d" "$SRC/files/root"
+cat > "$SRC/files/usr/share/usb_modeswitch/0e8d:2870" << 'MSR'
+TargetVendor=0e8d
+TargetProduct=7612
+StandardEject=1
+MSR
+cp -f "$SRC/files/usr/share/usb_modeswitch/0e8d:2870" "$SRC/files/etc/usb_modeswitch.d/0e8d:2870" 2>/dev/null || true
+
+cat > "$SRC/files/root/modesw.sh" << 'MSKEY'
+#!/bin/sh
+# 钥匙：把 ZeroCD 状态的 MT7612U 弹成 WiFi 模式（0e8d:2870 -> 0e8d:7612）
+v() { cat /sys/bus/usb/devices/1-1/idVendor 2>/dev/null; }
+p() { cat /sys/bus/usb/devices/1-1/idProduct 2>/dev/null; }
+echo "== 当前身份: $(v):$(p) =="
+[ "$(v)" = "0e8d" ] && [ "$(p)" = "7612" ] && { echo "已经是 WiFi 模式，直接建监听口"; sh /root/dual-radio.sh; exit 0; }
+[ "$(v)" = "0e8d" ] && [ "$(p)" = "2870" ] || { echo "没看到 0e8d:2870，也没有 7612，插好了再跑"; exit 1; }
+echo "==> 弹 ZeroCD（多法逐条试，谁成用谁）"
+usb-modeswitch -v 0e8d -p 2870 && echo "   [方式1] 默认规则 已执行"
+sleep 3
+if [ "$(p)" != "7612" ]; then usb-modeswitch -v 0e8d -p 2870 -c /etc/usb_modeswitch.d/0e8d:2870 && echo "   [方式2] 指定配置 已执行"; sleep 3; fi
+if [ "$(p)" != "7612" ]; then usb-modeswitch -v 0e8d -p 2870 -S && echo "   [方式3] StandardEject 已执行"; sleep 3; fi
+echo "== 弹出后身份: $(v):$(p) =="
+if [ "$(p)" = "7612" ]; then
+	echo "==> 成功，等 mt76x2u 绑定"
+	sleep 3
+	iw dev | sed 's/^/  /'
+	sh /root/dual-radio.sh
+else
+	echo "!! 没弹成。请把上面回显整段发我（含 usb-modeswitch 自己的报错）"
+fi
+MSKEY
+chmod 755 "$SRC/files/root/modesw.sh"
 
 cat > "$SRC/files/etc/uci-defaults/99-hd51-basic" << 'EOF'
 #!/bin/sh
@@ -351,6 +385,19 @@ add_cfg CONFIG_PACKAGE_urngd
 # DTS 里 &sdhci status=okay 早已在位，驱动装上即可识卡
 add_cfg CONFIG_PACKAGE_kmod-sdhci-mt7620
 add_cfg CONFIG_PACKAGE_kmod-mmc
+# v26：MT7612U 的 ZeroCD 弹出（0e8d:2870 假光驱 -> 0e8d:7612 WiFi）
+add_cfg CONFIG_PACKAGE_usb-modeswitch
+add_cfg CONFIG_PACKAGE_usb-modeswitch-data
+
+# v26：TF 卡槽卡检测改软件轮询（HD51 的 CD 脚很可能未接入 SoC，CD_POLL=n 时永远认为无卡）
+MK="$SRC/target/linux/ramips/modules.mk"
+if grep -q "CONFIG_MTK_MMC_CD_POLL=n" "$MK" 2>/dev/null; then
+	sed -i 's/CONFIG_MTK_MMC_CD_POLL=n/CONFIG_MTK_MMC_CD_POLL=y/' "$MK"
+	echo "==> [v26] CD_POLL 已由 n 改为 y"
+else
+	echo "!! [v26] modules.mk 里没找到 CONFIG_MTK_MMC_CD_POLL=n，需人工确认"
+fi
+grep -n "CONFIG_MTK_MMC_CD_POLL" "$MK" || true
 # v21：USB 无线网卡三件——RT3070 / AR9271 / MT7612U
 add_cfg CONFIG_PACKAGE_kmod-rt2800-usb
 add_cfg CONFIG_PACKAGE_kmod-ath9k-htc
