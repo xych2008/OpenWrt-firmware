@@ -278,24 +278,17 @@ echo "烘入校准文件 $(wc -c < "$SRC/files/lib/firmware/soc_wmac.eeprom") �
 # 版本标记：浏览器打开 http://192.168.1.1/ver.txt 就能确认烧进去的是哪一版
 mkdir -p "$SRC/files/www"
 cat > "$SRC/files/www/ver.txt" << 'VEREOF'
-HD51 v27
+HD51 v28
 build: 2026-11-20
 dts: /delete-property/ ralink,eeprom + ralink,mtd-eeprom = <&factory 0x0>
 wireless: baked (/etc/config/wireless, radio0, SSID HD51, open)
 sd: &sdhci status=okay
 VEREOF
 
-# ===== v24 唯一改动：dropbear host key 校验桩 =====
-# 病因：镜像内没有 /usr/bin/dropbearkey，/etc/init.d/dropbear 的 hk_verify() 必然失败
-#      -> hk_generate_as_needed() 每次开机现场生成 RSA 2048 密钥（实测吃 93.7 秒）
-# 修法：放一个只返回 0 的桩，让 dropbear 直接使用 /etc/dropbear 里预生成的两把密钥
-mkdir -p "$SRC/files/usr/bin"
-cat > "$SRC/files/usr/bin/dropbearkey" << 'DBKEOF'
-#!/bin/sh
-# HD51 v24 stub: 仅用于让 dropbear 的 hk_verify() 通过，不做真实密钥运算
-exit 0
-DBKEOF
-chmod 755 "$SRC/files/usr/bin/dropbearkey"
+# ===== v28：摘掉 v24 的 dropbearkey 桩 =====
+# v27 实测：桩让 hk_verify 通过、dropbear 被喂了镜像里的密钥，但进程直接退出（22 端口 refused）
+# => 镜像里那两把密钥 dropbear 认不了。桩这条路作废，改用"现场自检 + 修根因"
+# 新增 /cgi-bin/dbk 自检页，刷完打开一次就能看到 dropbear 拒绝密钥的真实报错
 
 # ===== v26：7612 ZeroCD 规则与钥匙 =====
 mkdir -p "$SRC/files/usr/share/usb_modeswitch" "$SRC/files/etc/usb_modeswitch.d" "$SRC/files/root"
@@ -438,6 +431,25 @@ echo "==> .config 已补包（$CFG）"
 # ---------- 6. 硬件自检：开机自动生成 /www/probe.html ----------
 PROBE="$SRC/files/usr/bin/hd51-probe.sh"
 mkdir -p "$SRC/files/usr/bin" "$SRC/files/www/cgi-bin" "$SRC/files/etc/init.d"
+
+cat > "$SRC/files/www/cgi-bin/dbk" << 'DBKCGI'
+#!/bin/sh
+echo "Content-Type: text/plain; charset=utf-8"
+echo ""
+echo "===== /etc/dropbear 里的密钥 ====="
+ls -l /etc/dropbear/ 2>&1
+echo "===== 各文件字节数 ====="
+wc -c /etc/dropbear/* 2>/dev/null
+echo "===== 用 rsa 密钥前台试启 dropbear（5 秒后自动杀掉，端口 2222）====="
+timeout 5 /usr/sbin/dropbear -F -E -r /etc/dropbear/dropbear_rsa_host_key -p 2222 2>&1 | head -20
+echo "===== 用 ed25519 密钥前台试启 ====="
+timeout 5 /usr/sbin/dropbear -F -E -r /etc/dropbear/dropbear_ed25519_host_key -p 2223 2>&1 | head -20
+echo "===== 不带 -r 直接起（让它自己生成，5 秒）====="
+timeout 5 /usr/sbin/dropbear -F -E -p 2224 2>&1 | head -10
+echo "===== logread 里 dropbear 的报错 ====="
+logread 2>/dev/null | grep -i dropbear | tail -20
+DBKCGI
+chmod 755 "$SRC/files/www/cgi-bin/dbk"
 
 cat > "$PROBE" << 'PROBE_EOF'
 #!/bin/sh
