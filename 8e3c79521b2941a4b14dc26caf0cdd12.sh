@@ -122,8 +122,12 @@ cat > "$SRC/target/linux/ramips/dts/mt7620a_qianmi_hd51.dts" << 'EOF'
 
 &sdhci {
 	/* mt7620A 自带 SD 主机控制器（OpenWrt 有 830-mmc 补丁支持），
-	   dtsi 里默认 disabled，这里打开，卡槽若是走 SDHCI 就能直接识卡 */
+	   dtsi 里默认 disabled，这里打开 */
 	status = "okay";
+	/* v27：卡检测改软件轮询。依据：mtk_sd.ko 二进制里存在 "mediatek,cd-poll"
+	   属性名；Kconfig 的 CONFIG_MTK_MMC_CD_POLL 改了但模块 md5 与 v25 完全一致
+	   （实测未生效），真正开关是设备树属性 */
+	mediatek,cd-poll;
 };
 
 &pcie {
@@ -274,7 +278,7 @@ echo "烘入校准文件 $(wc -c < "$SRC/files/lib/firmware/soc_wmac.eeprom") �
 # 版本标记：浏览器打开 http://192.168.1.1/ver.txt 就能确认烧进去的是哪一版
 mkdir -p "$SRC/files/www"
 cat > "$SRC/files/www/ver.txt" << 'VEREOF'
-HD51 v26
+HD51 v27
 build: 2026-11-20
 dts: /delete-property/ ralink,eeprom + ralink,mtd-eeprom = <&factory 0x0>
 wireless: baked (/etc/config/wireless, radio0, SSID HD51, open)
@@ -311,10 +315,10 @@ echo "== 当前身份: $(v):$(p) =="
 [ "$(v)" = "0e8d" ] && [ "$(p)" = "7612" ] && { echo "已经是 WiFi 模式，直接建监听口"; sh /root/dual-radio.sh; exit 0; }
 [ "$(v)" = "0e8d" ] && [ "$(p)" = "2870" ] || { echo "没看到 0e8d:2870，也没有 7612，插好了再跑"; exit 1; }
 echo "==> 弹 ZeroCD（多法逐条试，谁成用谁）"
-usb-modeswitch -v 0e8d -p 2870 && echo "   [方式1] 默认规则 已执行"
+/sbin/usbmode -s && echo "   [方式1] usbmode -s 已执行"
 sleep 3
-if [ "$(p)" != "7612" ]; then usb-modeswitch -v 0e8d -p 2870 -c /etc/usb_modeswitch.d/0e8d:2870 && echo "   [方式2] 指定配置 已执行"; sleep 3; fi
-if [ "$(p)" != "7612" ]; then usb-modeswitch -v 0e8d -p 2870 -S && echo "   [方式3] StandardEject 已执行"; sleep 3; fi
+if [ "$(p)" != "7612" ]; then /etc/init.d/usbmode start && echo "   [方式2] init.d/usbmode start 已执行"; sleep 3; fi
+if [ "$(p)" != "7612" ]; then /sbin/usbmode -s -c /etc/usb-mode.json && echo "   [方式3] 指定 json 已执行"; sleep 3; fi
 echo "== 弹出后身份: $(v):$(p) =="
 if [ "$(p)" = "7612" ]; then
 	echo "==> 成功，等 mt76x2u 绑定"
