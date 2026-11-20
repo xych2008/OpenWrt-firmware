@@ -281,6 +281,18 @@ wireless: baked (/etc/config/wireless, radio0, SSID HD51, open)
 sd: &sdhci status=okay
 VEREOF
 
+# ===== v24 唯一改动：dropbear host key 校验桩 =====
+# 病因：镜像内没有 /usr/bin/dropbearkey，/etc/init.d/dropbear 的 hk_verify() 必然失败
+#      -> hk_generate_as_needed() 每次开机现场生成 RSA 2048 密钥（实测吃 93.7 秒）
+# 修法：放一个只返回 0 的桩，让 dropbear 直接使用 /etc/dropbear 里预生成的两把密钥
+mkdir -p "$SRC/files/usr/bin"
+cat > "$SRC/files/usr/bin/dropbearkey" << 'DBKEOF'
+#!/bin/sh
+# HD51 v24 stub: 仅用于让 dropbear 的 hk_verify() 通过，不做真实密钥运算
+exit 0
+DBKEOF
+chmod 755 "$SRC/files/usr/bin/dropbearkey"
+
 cat > "$SRC/files/etc/uci-defaults/99-hd51-basic" << 'EOF'
 #!/bin/sh
 uci -q set system.@system[0].hostname='HD51-v16' || true
