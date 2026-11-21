@@ -14,6 +14,20 @@ else
 fi
 [ -d "$SRC/target/linux/ramips" ] || { echo "!! 找不到 ramips 源码树"; exit 1; }
 
+# ---------- 0. SD 写卡超时修复（驱动层，失败则立即中止编译） ----------
+SD_SRC="$SRC/target/linux/ramips/files/drivers/mmc/host/mtk-mmc/sd.c"
+if [ ! -f "$SD_SRC" ]; then
+	SD_SRC="$(find "$SRC/target/linux" -path '*mtk-mmc/sd.c' -print -quit)"
+fi
+[ -n "$SD_SRC" ] && [ -f "$SD_SRC" ] || { echo "!! 找不到 mtk-mmc/sd.c，中止"; exit 1; }
+echo "SD_PATCH 目标: $SD_SRC"
+sed -i 's|^#define CMD_TIMEOUT.*|#define CMD_TIMEOUT (HZ * 5)  /* HD51: 写卡后等 busy 5 秒 */|' "$SD_SRC"
+sed -i 's|^#define DAT_TIMEOUT.*|#define DAT_TIMEOUT (HZ * 30) /* HD51: 数据传输等 30 秒 */|' "$SD_SRC"
+grep -q "HZ \* 5" "$SD_SRC" || { echo "!! CMD_TIMEOUT 未生效，中止"; exit 1; }
+grep -q "HZ \* 30" "$SD_SRC" || { echo "!! DAT_TIMEOUT 未生效，中止"; exit 1; }
+grep -n "#define CMD_TIMEOUT\|#define DAT_TIMEOUT" "$SD_SRC" | head -4
+
+
 # ---------- 1. DTS ----------
 cat > "$SRC/target/linux/ramips/dts/mt7620a_qianmi_hd51.dts" << 'EOF'
 // SPDX-License-Identifier: GPL-2.0-or-later OR MIT
@@ -278,7 +292,7 @@ echo "烘入校准文件 $(wc -c < "$SRC/files/lib/firmware/soc_wmac.eeprom") �
 # 版本标记：浏览器打开 http://192.168.1.1/ver.txt 就能确认烧进去的是哪一版
 mkdir -p "$SRC/files/www"
 cat > "$SRC/files/www/ver.txt" << 'VEREOF'
-HD51 v29
+HD51 v30
 build: 2026-11-20
 dts: /delete-property/ ralink,eeprom + ralink,mtd-eeprom = <&factory 0x0>
 wireless: baked (/etc/config/wireless, radio0, SSID HD51, open)
