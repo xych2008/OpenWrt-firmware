@@ -1453,7 +1453,6 @@ case "$Q" in
    done
    echo "== cap"; ls -l /root/cap 2>/dev/null || echo "   未抓过" ;;
  a=mon)
-   airmon-ng start $(iw dev 2>/dev/null | awk '/Interface/{print $2}' | past 2>/dev/null)
    airmon-ng start $(iw dev 2>/dev/null | awk '/Interface/{print $2}' | head -1) 2>&1 | tail -3
    iw dev 2>/dev/null | grep -E 'Interface|type' ;;
  a=stopmon)
@@ -1463,7 +1462,6 @@ case "$Q" in
  *) echo "用法: /cgi-bin/audit?a=status | a=mon | a=stopmon | a=log" ;;
 esac
 A_EOF
-sed -i 's/| past 2>/dev/null//' "$SRC/files/www/cgi-bin/audit"
 chmod 755 "$SRC/files/www/cgi-bin/audit"
 
 # 审计台首页（手机直接开 /audit.html）
