@@ -293,7 +293,7 @@ echo "烘入校准文件 $(wc -c < "$SRC/files/lib/firmware/soc_wmac.eeprom") �
 # 版本标记：浏览器打开 http://192.168.1.1/ver.txt 就能确认烧进去的是哪一版
 mkdir -p "$SRC/files/www"
 cat > "$SRC/files/www/ver.txt" << 'VEREOF'
-HD51 v36
+HD51 v37
 build: 2026-11-21
 dts: /delete-property/ ralink,eeprom + ralink,mtd-eeprom = <&factory 0x0>
 wireless: baked (/etc/config/wireless, radio0, SSID HD51, open)
@@ -548,11 +548,8 @@ grep -q "PKG_NAME:=reaver" "$SRC/package/reaver/Makefile" || { echo "!! reaver M
 echo "==> [v35] reaver 包已放入 package/reaver"
 add_cfg CONFIG_PACKAGE_reaver
 add_cfg CONFIG_PACKAGE_hcxtools
-# v36：把 Python3 栈搬进固件（wifit3 的用户态驱动需要它），并把 SD 链接钩子烘死
-add_cfg CONFIG_PACKAGE_python3-light
-add_cfg CONFIG_PACKAGE_python3-ctypes
-add_cfg CONFIG_PACKAGE_libffi
-add_cfg CONFIG_PACKAGE_libusb-1.0
+# v37：Python3 栈不放固件（用户要求全走 SD），镜像只烘 SD 链接钩子；python 由官方 22.03.7 ipk
+#       解包到 /data/py3 后运行（见 /data/py3/bin/python3 包装器）
 
 # v26：TF 卡槽卡检测改软件轮询（HD51 的 CD 脚很可能未接入 SoC，CD_POLL=n 时永远认为无卡）
 MK="$SRC/target/linux/ramips/modules.mk"
