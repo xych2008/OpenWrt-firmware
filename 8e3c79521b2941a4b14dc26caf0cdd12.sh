@@ -293,7 +293,7 @@ echo "烘入校准文件 $(wc -c < "$SRC/files/lib/firmware/soc_wmac.eeprom") �
 # 版本标记：浏览器打开 http://192.168.1.1/ver.txt 就能确认烧进去的是哪一版
 mkdir -p "$SRC/files/www"
 cat > "$SRC/files/www/ver.txt" << 'VEREOF'
-HD51 v35
+HD51 v36
 build: 2026-11-21
 dts: /delete-property/ ralink,eeprom + ralink,mtd-eeprom = <&factory 0x0>
 wireless: baked (/etc/config/wireless, radio0, SSID HD51, open)
@@ -548,6 +548,11 @@ grep -q "PKG_NAME:=reaver" "$SRC/package/reaver/Makefile" || { echo "!! reaver M
 echo "==> [v35] reaver 包已放入 package/reaver"
 add_cfg CONFIG_PACKAGE_reaver
 add_cfg CONFIG_PACKAGE_hcxtools
+# v36：把 Python3 栈搬进固件（wifit3 的用户态驱动需要它），并把 SD 链接钩子烘死
+add_cfg CONFIG_PACKAGE_python3-light
+add_cfg CONFIG_PACKAGE_python3-ctypes
+add_cfg CONFIG_PACKAGE_libffi
+add_cfg CONFIG_PACKAGE_libusb-1.0
 
 # v26：TF 卡槽卡检测改软件轮询（HD51 的 CD 脚很可能未接入 SoC，CD_POLL=n 时永远认为无卡）
 MK="$SRC/target/linux/ramips/modules.mk"
@@ -1553,6 +1558,28 @@ start() {
 TDIR
 chmod 755 "$SRC/files/etc/init.d/tdirs"
 echo "==> v34 transmission 配置 + 下载目录初始化已写入"
+
+
+# v36：开机钩子——/www 只当入口，实体全在 SD（刷机后自动重建，不用再敲命令）
+mkdir -p "$SRC/files/etc/init.d" "$SRC/files/etc/rc.d"
+cat > "$SRC/files/etc/init.d/sdlink" << 'SDLE'
+#!/bin/sh /etc/rc.common
+START=96
+start() {
+	i=0
+	while [ $i -lt 40 ]; do [ -d /data/ui ] && break; sleep 1; i=$((i+1)); done
+	[ -d /data/ui ] || return 0
+	mkdir -p /data/logs /data/cap
+	ln -sfn /data/logs /www/logs
+	ln -sfn /data/cap /www/cap
+	for f in /data/ui/*.html; do [ -f "$f" ] && ln -sf "$f" "/www/$(basename "$f")"; done
+	for f in /data/ui/a3*; do case "$f" in *.html) ;; *) [ -f "$f" ] && ln -sf "$f" "/www/cgi-bin/$(basename "$f")";; esac; done
+	chmod 755 /data/ui/*.sh /data/ui/a3* 2>/dev/null
+}
+SDLE
+chmod 755 "$SRC/files/etc/init.d/sdlink"
+ln -sf ../init.d/sdlink "$SRC/files/etc/rc.d/S96sdlink"
+echo "==> [v36] sdlink 开机钩子已烘入"
 
 # ===== v35：把审计台 6.0 全功能烘进镜像（wifit3 对标：扫描/握手/PMKID/挂机/WEP/WPS + 能力矩阵）=====
 mkdir -p "$SRC/files/root" "$SRC/files/www/cgi-bin"
