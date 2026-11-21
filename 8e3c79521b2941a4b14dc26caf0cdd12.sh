@@ -27,13 +27,6 @@ grep -q "HZ \* 5" "$SD_SRC" || { echo "!! CMD_TIMEOUT 未生效，中止"; exit 
 grep -q "HZ \* 30" "$SD_SRC" || { echo "!! DAT_TIMEOUT 未生效，中止"; exit 1; }
 grep -n "#define CMD_TIMEOUT\|#define DAT_TIMEOUT" "$SD_SRC" | head -4
 
-# ---------- 0b. 4 位总线写入静默丢失 -> 强制 1 位 + 时钟降到 25MHz ----------
-sed -i -E 's#mmc->caps  \|= MMC_CAP_4_BIT_DATA;#/* HD51: 关闭 4 位总线，改 1 位 */#' "$SD_SRC" || true
-sed -i 's|^#define HOST_MAX_MCLK.*|#define HOST_MAX_MCLK (25000000) /* HD51: 降到 25MHz */|' "$SD_SRC"
-if grep -q "MMC_CAP_4_BIT_DATA" "$SD_SRC"; then echo "!! 4 位总线下不掉，中止"; exit 1; fi
-if ! grep -q "HOST_MAX_MCLK (25000000)" "$SD_SRC"; then echo "!! 25MHz 未生效，中止"; exit 1; fi
-echo "==> 1 位总线 + 25MHz 已打上"
-grep -n "HOST_MAX_MCLK\|关闭 4 位" "$SD_SRC" | head -4
 
 
 # ---------- 1. DTS ----------
@@ -300,7 +293,7 @@ echo "烘入校准文件 $(wc -c < "$SRC/files/lib/firmware/soc_wmac.eeprom") �
 # 版本标记：浏览器打开 http://192.168.1.1/ver.txt 就能确认烧进去的是哪一版
 mkdir -p "$SRC/files/www"
 cat > "$SRC/files/www/ver.txt" << 'VEREOF'
-HD51 v32
+HD51 v33
 build: 2026-11-20
 dts: /delete-property/ ralink,eeprom + ralink,mtd-eeprom = <&factory 0x0>
 wireless: baked (/etc/config/wireless, radio0, SSID HD51, open)
@@ -1491,3 +1484,23 @@ H_EOF
 chmod 644 "$SRC/files/www/audit.html"
 echo "==> v31 审计三件套脚本已写入"
 
+# ================= v33：把 SD 钥匙烘进镜像（刷机后不用再粘脚本） =================
+cat > "$SRC/files/root/sd4.sh" << 'SD4EOF'
+#!/bin/sh
+exec >/www/sd.log 2>&1
+echo T_START; date
+umount /mnt/mmcblk0p1 2>/dev/null; sleep 1
+echo MOUNTS:; grep mmcblk0 /proc/mounts || echo none
+mkfs.ext4 -F -L overlay -O ^orphan_file -J size=4 -E nodiscard /dev/mmcblk0
+echo MKFS_RC=$?
+sync; sleep 2
+echo VERIFY:; blkid -c /dev/null /dev/mmcblk0
+echo T_END
+SD4EOF
+chmod 755 "$SRC/files/root/sd4.sh"
+cat > "$SRC/files/root/sd" << 'SDEOF'
+#!/bin/sh
+exec /sbin/start-stop-daemon -S -b -m -p /var/run/sd4.pid -x /root/sd4.sh
+SDEOF
+chmod 755 "$SRC/files/root/sd"
+echo "==> SD 钥匙已烘入（/root/sd4.sh + /root/sd）"
