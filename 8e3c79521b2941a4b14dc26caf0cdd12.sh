@@ -293,7 +293,7 @@ echo "烘入校准文件 $(wc -c < "$SRC/files/lib/firmware/soc_wmac.eeprom") �
 # 版本标记：浏览器打开 http://192.168.1.1/ver.txt 就能确认烧进去的是哪一版
 mkdir -p "$SRC/files/www"
 cat > "$SRC/files/www/ver.txt" << 'VEREOF'
-HD51 v37
+HD51 v38
 build: 2026-11-21
 dts: /delete-property/ ralink,eeprom + ralink,mtd-eeprom = <&factory 0x0>
 wireless: baked (/etc/config/wireless, radio0, SSID HD51, open)
@@ -548,6 +548,44 @@ grep -q "PKG_NAME:=reaver" "$SRC/package/reaver/Makefile" || { echo "!! reaver M
 echo "==> [v35] reaver 包已放入 package/reaver"
 add_cfg CONFIG_PACKAGE_reaver
 add_cfg CONFIG_PACKAGE_hcxtools
+# v38：zram 压缩内存 + WebDAV（lighttpd 8088，共享 /data/share）
+add_cfg CONFIG_PACKAGE_zram-swap
+add_cfg CONFIG_PACKAGE_lighttpd
+add_cfg CONFIG_PACKAGE_lighttpd-mod-webdav_min
+
+# v38：lighttpd 只跑 WebDAV，端口 8088，避开 uhttpd 的 80；共享目录在 SD
+mkdir -p "$SRC/files/etc/lighttpd" "$SRC/files/etc/init.d"
+cat > "$SRC/files/etc/lighttpd/lighttpd.conf" << 'LTC'
+server.port                 = 8088
+server.modules              = ( "mod_webdav", "mod_dirlisting", "mod_staticfile" )
+server.document-root        = "/data/share"
+server.upload-dirs          = ( "/data/tmp" )
+server.username             = "www-data"
+server.groupname            = "www-data"
+server.max-request-size     = 4096
+dir-listing.activate        = "enable"
+webdav.is-readonly          = "disable"
+webdav.log-xml              = "disable"
+mimetype.assign             = ( ".html" => "text/html", ".txt" => "text/plain", ".jpg" => "image/jpeg", ".png" => "image/png", ".bin" => "application/octet-stream" )
+LTC
+
+# v38：开机准备共享目录和临时目录（都在 SD，不写闪存）
+cat > "$SRC/files/etc/init.d/nasprep" << 'NSP'
+#!/bin/sh /etc/rc.common
+START=96
+boot() {
+	mkdir -p /data/share /data/tmp 2>/dev/null
+	chmod 777 /data/share /data/tmp 2>/dev/null
+}
+NSP
+chmod 755 "$SRC/files/etc/init.d/nasprep"
+
+# v38：把 ksmbd / lighttpd / zram / nasprep 设成开机自启
+mkdir -p "$SRC/files/etc/rc.d"
+ln -sf ../init.d/ksmbd      "$SRC/files/etc/rc.d/S50ksmbd"
+ln -sf ../init.d/zram-swap  "$SRC/files/etc/rc.d/S20zram-swap"
+ln -sf ../init.d/lighttpd   "$SRC/files/etc/rc.d/S90lighttpd"
+ln -sf ../init.d/nasprep    "$SRC/files/etc/rc.d/S96nasprep"
 # v37：Python3 栈不放固件（用户要求全走 SD），镜像只烘 SD 链接钩子；python 由官方 22.03.7 ipk
 #       解包到 /data/py3 后运行（见 /data/py3/bin/python3 包装器）
 
