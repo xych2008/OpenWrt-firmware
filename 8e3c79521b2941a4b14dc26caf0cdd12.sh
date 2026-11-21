@@ -293,7 +293,7 @@ echo "烘入校准文件 $(wc -c < "$SRC/files/lib/firmware/soc_wmac.eeprom") �
 # 版本标记：浏览器打开 http://192.168.1.1/ver.txt 就能确认烧进去的是哪一版
 mkdir -p "$SRC/files/www"
 cat > "$SRC/files/www/ver.txt" << 'VEREOF'
-HD51 v33
+HD51 v34
 build: 2026-11-20
 dts: /delete-property/ ralink,eeprom + ralink,mtd-eeprom = <&factory 0x0>
 wireless: baked (/etc/config/wireless, radio0, SSID HD51, open)
@@ -536,6 +536,9 @@ add_cfg CONFIG_PACKAGE_vsftpd
 # v31：审计三件套里的两套内核/用户态工具（源已核实存在 openwrt-23.05 分支）
 add_cfg CONFIG_PACKAGE_aircrack-ng
 add_cfg CONFIG_PACKAGE_hcxdumptool
+# v34：种子下载（transmission + 网页端），下载目录落在 SD 的 /overlay
+add_cfg CONFIG_PACKAGE_transmission-daemon
+add_cfg CONFIG_PACKAGE_transmission-web
 
 # v26：TF 卡槽卡检测改软件轮询（HD51 的 CD 脚很可能未接入 SoC，CD_POLL=n 时永远认为无卡）
 MK="$SRC/target/linux/ramips/modules.mk"
@@ -1504,3 +1507,40 @@ exec /sbin/start-stop-daemon -S -b -m -p /var/run/sd4.pid -x /root/sd4.sh
 SDEOF
 chmod 755 "$SRC/files/root/sd"
 echo "==> SD 钥匙已烘入（/root/sd4.sh + /root/sd）"
+
+# ================= v34：种子下载（transmission-daemon + 网页端） =================
+mkdir -p "$SRC/files/etc/config" "$SRC/files/etc/init.d"
+cat > "$SRC/files/etc/config/transmission" << 'TRCFG'
+config transmission
+	option enabled 1
+	option user 'root'
+	option group 'root'
+	option config_dir '/overlay/transmission'
+	option download_dir '/overlay/downloads'
+	option incomplete_dir_enabled 0
+	option cache_size_mb 4
+	option peer_limit_global 30
+	option peer_limit_per_torrent 20
+	option download_queue_size 4
+	option preallocation 1
+	option rpc_enabled true
+	option rpc_bind_address '0.0.0.0'
+	option rpc_port 9091
+	option rpc_url '/transmission/'
+	option rpc_authentication_required false
+	option rpc_whitelist_enabled false
+	option utp_enabled true
+	option dht_enabled true
+	option pex_enabled true
+TRCFG
+
+cat > "$SRC/files/etc/init.d/tdirs" << 'TDIR'
+#!/bin/sh /etc/rc.common
+START=90
+start() {
+	mkdir -p /overlay/transmission /overlay/downloads
+	chmod 777 /overlay/downloads 2>/dev/null
+}
+TDIR
+chmod 755 "$SRC/files/etc/init.d/tdirs"
+echo "==> v34 transmission 配置 + 下载目录初始化已写入"
